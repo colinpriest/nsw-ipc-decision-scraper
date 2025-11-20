@@ -4,6 +4,7 @@ import csv
 import logging
 import json
 import re
+import shutil
 from typing import Optional, List
 from enum import Enum
 import requests
@@ -13,6 +14,9 @@ from openai import OpenAI
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import datetime
+import random
+from threading import Lock
 
 # Configure logging
 logging.basicConfig(
@@ -92,7 +96,6 @@ class LLMExtractor:
             return self._get_empty_schema()
             
         highlights = self._get_financial_highlights(text)
-        # logging.info("Running AI extraction (GPT-4o)...") 
         data = self._call_llm(text, highlights)
         
         # Retry logic
@@ -102,7 +105,6 @@ class LLMExtractor:
            data.medical_costs_awarded == MedicalCostsEnum.NO:
              
              if "$" in data.case_description or "compensation" in data.decision_nature.lower():
-                # logging.warning(f"Detected inconsistencies. Retrying...")
                 data = self._call_llm(text, highlights, retry_mode=True)
             
         return data.model_dump()
@@ -198,6 +200,7 @@ class DecisionScraper:
         self.output_folder = output_folder
         self.extractor = LLMExtractor(api_key) if api_key else None
         self.cache_file = "processed_cache.json"
+        self.cache_lock = Lock() # Thread lock for cache operations
         self.cache = self._load_cache()
         
         self.headers = {
@@ -208,128 +211,175 @@ class DecisionScraper:
             os.makedirs(self.output_folder)
 
     def _load_cache(self):
+        """Loads cache safely. If corrupted, backs up and starts empty."""
         if os.path.exists(self.cache_file):
-            with open(self.cache_file, 'r') as f:
-                return json.load(f)
+            try:
+                with open(self.cache_file, 'r') as f:
+                    return json.load(f)
+            except json.JSONDecodeError:
+                logging.error(f"Cache file {self.cache_file} is corrupted. Starting with empty cache.")
+                shutil.move(self.cache_file, self.cache_file + ".corrupted")
+                return {}
         return {}
 
     def _save_cache(self):
-        with open(self.cache_file, 'w') as f:
-            json.dump(self.cache, f, indent=2, default=str)
+        """
+        Thread-safe atomic write.
+        Copies cache under lock, dumps to temp file, then renames.
+        """
+        temp_file = self.cache_file + ".tmp"
+        
+        # Create a thread-safe snapshot of the data
+        with self.cache_lock:
+            cache_copy = self.cache.copy()
+            
+        try:
+            with open(temp_file, 'w') as f:
+                json.dump(cache_copy, f, indent=2, default=str)
+            os.replace(temp_file, self.cache_file)
+        except Exception as e:
+            logging.error(f"Failed to save cache: {e}")
+
+    def update_cache(self, url, data):
+        """Thread-safe cache update helper"""
+        with self.cache_lock:
+            self.cache[url] = data
+
+    def _make_request_with_retry(self, url, max_retries=5):
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(url, headers=self.headers, timeout=30)
+                
+                if response.status_code == 200:
+                    return response
+                
+                if response.status_code in [403, 429, 500, 502, 503, 504]:
+                    sleep_time = (2 ** attempt) + random.uniform(0, 1)
+                    logging.warning(f"Request failed ({response.status_code}) for {url}. Retrying in {sleep_time:.2f}s...")
+                    time.sleep(sleep_time)
+                else:
+                    logging.error(f"Request failed ({response.status_code}) for {url}. No retry.")
+                    return None
+                    
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.ChunkedEncodingError) as e:
+                 sleep_time = (2 ** attempt) + random.uniform(0, 1)
+                 logging.warning(f"Connection error ({e}) for {url}. Retrying in {sleep_time:.2f}s...")
+                 time.sleep(sleep_time)
+        
+        logging.error(f"Max retries exceeded for {url}")
+        return None
 
     def get_decision_links(self, index_url):
         logging.info(f"Fetching index: {index_url}")
-        try:
-            response = requests.get(index_url, headers=self.headers)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            links = []
-            decision_url_pattern = re.compile(r"\/NSWPIC\/20\d\d\/\d+\.html")
-
-            for a in soup.find_all('a', href=True):
-                href = a['href']
-                full_url = urljoin(self.base_url, href)
-                
-                if decision_url_pattern.search(full_url):
-                    title = a.get_text(" ", strip=True)
-                    if 5 < len(title) < 250:
-                        links.append((title, full_url))
-            
-            unique_links = {}
-            for title, url in links:
-                if url not in unique_links:
-                    unique_links[url] = title
-            
-            return [(title, url) for url, title in unique_links.items()]
-            
-        except Exception as e:
-            logging.error(f"Error fetching index: {e}")
+        
+        response = self._make_request_with_retry(index_url)
+        if not response:
             return []
 
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        links = []
+        decision_url_pattern = re.compile(r"\/NSWPIC\/\d{4}\/\d+\.html")
+
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            full_url = urljoin(self.base_url, href)
+            
+            if decision_url_pattern.search(full_url):
+                title = a.get_text(" ", strip=True)
+                if 5 < len(title) < 250:
+                    links.append((title, full_url))
+        
+        unique_links = {}
+        for title, url in links:
+            if url not in unique_links:
+                unique_links[url] = title
+        
+        return [(title, url) for url, title in unique_links.items()]
+
     def process_decision(self, title, url):
-        safe_title = "".join([c for c in title if c.isalnum() or c in (' ', '-', '_', '.')])
-        safe_title = re.sub(r'[\s]+', '_', safe_title).strip('_')
-        safe_title = safe_title[:100]
+        safe_title = re.sub(r'[^\w\s\-\.]', '', title)
+        safe_title = re.sub(r'[\s]+', '_', safe_title)
+        safe_title = safe_title[:100] + ".html"
         
         log_title = (title[:75] + '...') if len(title) > 75 else title
 
-        if url in self.cache:
-            return self.cache[url]
+        # Check cache under lock is safer, though read-only access to dict is atomic in GIL
+        # But to be safe and consistent:
+        with self.cache_lock:
+            if url in self.cache:
+                return self.cache[url]
 
         logging.info(f"Processing: {log_title}")
         
-        try:
-            response = requests.get(url, headers=self.headers)
-            if response.status_code in [403, 429]:
-                logging.warning(f"Rate limited on {log_title}. Skipping.")
-                return None
-            
-            response.raise_for_status()
-            
-            saved_filename = f"{safe_title}.html"
-            full_path = os.path.join(self.output_folder, saved_filename)
-            
-            with open(full_path, 'wb') as f:
-                f.write(response.content)
-            
-            decision_text = self.extractor.extract_text_from_html(response.content)
-            
-            if len(decision_text) < 500:
-                return None
-
-            result_data = None
-            if self.extractor:
-                llm_data = self.extractor.extract_data(decision_text)
-                
-                result_data = {
-                    "Case Name": title,
-                    "URL": url,
-                    "File Saved": saved_filename,
-                    "Jurisdiction": llm_data.get("jurisdiction"),
-                    "Case Type": llm_data.get("case_type"),
-                    "Decision Date": llm_data.get("date_of_decision"),
-                    "Injury Date": llm_data.get("date_of_injury"),
-                    "Applicant": llm_data.get("applicant_name"),
-                    "Respondent": llm_data.get("respondent_name"),
-                    "Claimant Outcome": llm_data.get("claimant_outcome"),
-                    "Impairment %": llm_data.get("impairment_percentage"),
-                    "Lump Sum": llm_data.get("lump_sum_amount"),
-                    "Weekly Benefit": llm_data.get("weekly_benefit_amount"),
-                    "Medical Costs": llm_data.get("medical_costs_awarded"),
-                    "Nature": llm_data.get("decision_nature"),
-                    "Result": llm_data.get("decision_result"),
-                    "Description": llm_data.get("case_description")
-                }
-                
-                self.cache[url] = result_data
-                
-            return result_data
-
-        except Exception as e:
-            logging.error(f"Failed to process {log_title}: {e}")
+        response = self._make_request_with_retry(url)
+        if not response:
+            logging.error(f"Failed to fetch content for {log_title} after retries.")
             return None
+            
+        full_path = os.path.join(self.output_folder, safe_title)
+        with open(full_path, 'wb') as f:
+            f.write(response.content)
+        
+        decision_text = self.extractor.extract_text_from_html(response.content)
+        
+        if len(decision_text) < 500:
+            return None
+
+        result_data = None
+        if self.extractor:
+            llm_data = self.extractor.extract_data(decision_text)
+            
+            result_data = {
+                "Case Name": title,
+                "URL": url,
+                "File Saved": safe_title,
+                "Jurisdiction": llm_data.get("jurisdiction"),
+                "Case Type": llm_data.get("case_type"),
+                "Decision Date": llm_data.get("date_of_decision"),
+                "Injury Date": llm_data.get("date_of_injury"),
+                "Applicant": llm_data.get("applicant_name"),
+                "Respondent": llm_data.get("respondent_name"),
+                "Claimant Outcome": llm_data.get("claimant_outcome"),
+                "Impairment %": llm_data.get("impairment_percentage"),
+                "Lump Sum": llm_data.get("lump_sum_amount"),
+                "Weekly Benefit": llm_data.get("weekly_benefit_amount"),
+                "Medical Costs": llm_data.get("medical_costs_awarded"),
+                "Nature": llm_data.get("decision_nature"),
+                "Result": llm_data.get("decision_result"),
+                "Description": llm_data.get("case_description")
+            }
+            
+            # Update cache safely
+            self.update_cache(url, result_data)
+            
+        return result_data
 
 def main():
     load_dotenv()
     api_key = os.getenv("OPENAI_API_KEY")
-    
     if not api_key:
         logging.warning("⚠️ OPENAI_API_KEY not found in .env file.")
         return
 
-    TARGET_INDEX_URL = "http://www.austlii.edu.au/cgi-bin/viewdb/au/cases/nsw/NSWPIC/2025/"
     BASE_DOMAIN = "http://www.austlii.edu.au"
     OUTPUT_DIR = "nsw_pic_decisions"
     CSV_REPORT = "detailed_payout_summary.csv"
-    
     scraper = DecisionScraper(BASE_DOMAIN, OUTPUT_DIR, api_key)
     
-    links = scraper.get_decision_links(TARGET_INDEX_URL)
-    logging.info(f"Found {len(links)} potential decisions.")
+    years = list(range(2021, datetime.datetime.now().year + 1))
+    all_links = []
+
+    for year in years:
+        index_url = f"http://www.austlii.edu.au/cgi-bin/viewdb/au/cases/nsw/NSWPIC/{year}/"
+        logging.info(f"Scanning Year: {year} ...")
+        links = scraper.get_decision_links(index_url)
+        all_links.extend(links)
+        time.sleep(2)
+
+    logging.info(f"Total decisions found (2021-Present): {len(all_links)}")
     
-    # UPDATED: Remove slicing to process ALL links found
-    target_links = links 
+    target_links = all_links 
     
     logging.info(f"Starting parallel processing of {len(target_links)} decisions (10 threads)...")
     results = []
@@ -337,16 +387,23 @@ def main():
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_url = {executor.submit(scraper.process_decision, title, url): url for title, url in target_links}
         
-        for future in as_completed(future_to_url):
+        for i, future in enumerate(as_completed(future_to_url)):
             data = future.result()
             if data:
                 results.append(data)
+            
+            # Save cache periodically (e.g., every 20 completions)
+            if i > 0 and i % 20 == 0:
+                scraper._save_cache()
     
+    # Final save
     scraper._save_cache()
 
-    results.sort(key=lambda x: x.get("Decision Date") or "0000-00-00", reverse=True)
-
-    all_data = list(scraper.cache.values())
+    # Use thread-safe snapshot for final report generation
+    with scraper.cache_lock:
+        all_data = list(scraper.cache.values())
+    
+    all_data.sort(key=lambda x: x.get("Decision Date") or "0000-00-00", reverse=True)
     
     if all_data:
         keys = [

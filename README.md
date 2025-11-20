@@ -48,11 +48,11 @@ python nsw_court_scraper.py
 ```
 
 The script will:
-1. Fetch the list of decisions from the AustLII NSWPIC index
+1. Fetch the list of decisions from AustLII NSWPIC indexes for years 2021 to present
 2. Process each decision (using cached data when available)
 3. Save HTML files to `nsw_pic_decisions/`
 4. Generate a CSV report: `detailed_payout_summary.csv`
-5. Update the cache file: `processed_cache.json`
+5. Update the cache file: `processed_cache.json` (saved periodically during processing)
 
 ## Output Files
 
@@ -89,9 +89,12 @@ Log file containing execution details, errors, and processing status.
 
 ## How It Works
 
-1. **Index Scraping**: Fetches the AustLII NSWPIC index page and identifies decision links using regex pattern matching (`/NSWPIC/YYYY/NUMBER.html`)
+1. **Multi-Year Index Scraping**: Fetches AustLII NSWPIC index pages for years 2021 to present, identifying decision links using regex pattern matching (`/NSWPIC/YYYY/NUMBER.html`)
 
-2. **HTML Download**: Downloads each decision's HTML file and saves it locally
+2. **HTML Download with Retry Logic**: Downloads each decision's HTML file with exponential backoff retry logic:
+   - Handles rate limiting (403, 429) and server errors (500, 502, 503, 504)
+   - Retries connection errors and timeouts
+   - Uses random jitter to avoid thundering herd problems
 
 3. **Text Extraction**: Extracts clean text from HTML, focusing on the main content area (article, document, or body)
 
@@ -101,39 +104,56 @@ Log file containing execution details, errors, and processing status.
    - Implements retry logic for inconsistent extractions
    - Handles long documents by truncating to key sections
 
-5. **Caching**: Checks cache before processing; saves new extractions to cache
+5. **Thread-Safe Caching**: 
+   - Checks cache before processing (thread-safe)
+   - Saves new extractions to cache with locking
+   - Periodically saves cache every 20 completions to prevent data loss
+   - Handles corrupted cache files by backing them up and starting fresh
 
 6. **Parallel Processing**: Uses ThreadPoolExecutor (10 workers) to process multiple decisions concurrently
 
-7. **CSV Generation**: Combines all cached and newly extracted data into a single CSV report
+7. **CSV Generation**: Combines all cached and newly extracted data into a single CSV report, sorted by decision date
 
 ## Configuration
 
 You can modify these settings in `nsw_court_scraper.py`:
 
-- **TARGET_INDEX_URL**: Change the AustLII index URL to scrape different years or jurisdictions
+- **Years to process**: Modify the `years` list in `main()` to change the range (currently 2021 to present)
 - **OUTPUT_DIR**: Change the output directory name
 - **CSV_REPORT**: Change the CSV filename
 - **ThreadPoolExecutor max_workers**: Adjust the number of parallel threads (default: 10)
+- **Retry settings**: Adjust `max_retries` in `_make_request_with_retry()` (default: 5)
+- **Cache save frequency**: Change the interval in `main()` where cache is saved (currently every 20 completions)
 
 ## Important Notes
 
 ### Rate Limiting
 - AustLII has anti-scraping measures
-- The script handles 403/429 errors gracefully
-- If you encounter rate limiting, wait before retrying
-- Consider reducing `max_workers` if you encounter frequent rate limits
+- The script automatically handles 403/429 errors with exponential backoff retry logic
+- Retries up to 5 times with increasing delays (2^attempt seconds + random jitter)
+- If you encounter persistent rate limiting, consider:
+  - Reducing `max_workers` (default: 10)
+  - Increasing delays between index page requests
+  - Processing fewer years at once
 
 ### Testing Mode
 To test with only the latest 8 decisions, modify the `main()` function:
 ```python
 # Process only the latest 8 decisions for testing
-latest_links = links[-8:] if len(links) > 8 else links
-target_links = latest_links
+target_links = all_links[-8:] if len(all_links) > 8 else all_links
+```
+
+Or to test with only a specific year:
+```python
+# Process only 2024 decisions for testing
+years = [2024]
 ```
 
 ### Cache Management
 - The cache file (`processed_cache.json`) stores all processed decisions
+- Cache is saved periodically (every 20 completions) to prevent data loss
+- Thread-safe operations ensure cache integrity during parallel processing
+- If the cache file becomes corrupted, it's automatically backed up (`.corrupted` extension) and a new cache is started
 - To reprocess all decisions, delete or rename the cache file
 - The cache prevents unnecessary API calls and saves costs
 
@@ -168,9 +188,10 @@ The extraction uses a structured Pydantic model (`DecisionSchema`) with the foll
 - Check that the `.env` file is in the same directory as the script
 
 ### "403 Forbidden" or "429 Too Many Requests"
-- AustLII is rate limiting your requests
-- Wait an hour before retrying
-- Reduce the number of parallel workers
+- The script automatically retries with exponential backoff
+- If retries are exhausted, the decision is skipped and logged
+- Check `scraper.log` to see which decisions failed
+- Consider reducing `max_workers` or processing fewer years at once
 
 ### Empty or incomplete extractions
 - Check `scraper.log` for detailed error messages
@@ -180,6 +201,11 @@ The extraction uses a structured Pydantic model (`DecisionSchema`) with the foll
 ### Import errors
 - Ensure all dependencies are installed: `pip install -r requirements.txt`
 - Check Python version (3.8+ required)
+
+### Corrupted cache file
+- If you see "Cache file is corrupted" in the logs, the script automatically backs up the corrupted file (`.corrupted` extension) and starts fresh
+- You can manually inspect the corrupted backup if needed
+- The script will continue processing with an empty cache
 
 ## License
 
