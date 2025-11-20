@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# Environment variables
+.env
+.env.local
+
+# Cache and data files
+processed_cache.json
+extraction_cache.json
+*.cache
+
+# Logs
+*.log
+scraper.log
+
+# Output files
+detailed_payout_summary.csv
+nsw_pic_decisions/
+nsw_decisions/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Jupyter
+.ipynb_checkpoints/
+
