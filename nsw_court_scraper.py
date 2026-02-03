@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime
 import random
 from threading import Lock
+from collections import defaultdict
 
 # Configure logging
 logging.basicConfig(
@@ -416,6 +417,70 @@ def main():
             dict_writer.writeheader()
             dict_writer.writerows(all_data)
         logging.info(f"Summary report saved to {CSV_REPORT}")
+
+    print_summary(all_data)
+
+def print_summary(all_data):
+    """Print data summary to console, split by Case Type."""
+    if not all_data:
+        print("\nNo data to summarise.")
+        return
+
+    lump_sum_counts = defaultdict(int)
+    impairment_counts = defaultdict(int)
+    both_counts = defaultdict(int)
+    injury_dates = defaultdict(list)
+    decision_dates = defaultdict(list)
+
+    for row in all_data:
+        case_type = row.get("Case Type") or "Unknown"
+        has_lump = bool(row.get("Lump Sum", "").strip())
+        has_impairment = bool(row.get("Impairment %", "").strip())
+
+        if has_lump:
+            lump_sum_counts[case_type] += 1
+        if has_impairment:
+            impairment_counts[case_type] += 1
+        if has_lump and has_impairment:
+            both_counts[case_type] += 1
+
+        inj = row.get("Injury Date", "").strip()
+        if inj and inj != "Unknown":
+            injury_dates[case_type].append(inj)
+
+        dec = row.get("Decision Date", "").strip()
+        if dec and dec != "Unknown":
+            decision_dates[case_type].append(dec)
+
+    case_types = sorted(set(
+        list(lump_sum_counts) + list(impairment_counts) + list(both_counts)
+        + list(injury_dates) + list(decision_dates)
+    ))
+
+    print("\n" + "=" * 70)
+    print("DATA SUMMARY")
+    print("=" * 70)
+
+    for ct in case_types:
+        print(f"\n--- {ct} ---")
+        print(f"  Rows with Lump Sum:              {lump_sum_counts.get(ct, 0)}")
+        print(f"  Rows with Impairment %:          {impairment_counts.get(ct, 0)}")
+        print(f"  Rows with both:                  {both_counts.get(ct, 0)}")
+
+        inj = injury_dates.get(ct, [])
+        if inj:
+            print(f"  Injury dates:                    {min(inj)} to {max(inj)}")
+        else:
+            print(f"  Injury dates:                    N/A")
+
+        dec = decision_dates.get(ct, [])
+        if dec:
+            print(f"  Decision dates:                  {min(dec)} to {max(dec)}")
+        else:
+            print(f"  Decision dates:                  N/A")
+
+    print("\n" + "=" * 70)
+
 
 if __name__ == "__main__":
     main()

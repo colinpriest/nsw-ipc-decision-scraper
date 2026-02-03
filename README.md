@@ -2,6 +2,8 @@
 
 A Python tool that scrapes NSW Personal Injury Commission (NSWPIC) decisions from AustLII and uses OpenAI's GPT-4o to extract structured legal information including payout amounts, injury details, dates, and case outcomes.
 
+![NSW Court Decisions](nsw-court-decisions.png)
+
 ## Features
 
 - **Automated Scraping**: Fetches court decisions from AustLII NSWPIC index
@@ -53,6 +55,7 @@ The script will:
 3. Save HTML files to `nsw_pic_decisions/`
 4. Generate a CSV report: `detailed_payout_summary.csv`
 5. Update the cache file: `processed_cache.json` (saved periodically during processing)
+6. Print a data summary to the console (counts of lump sums, impairment percentages, and date ranges, split by Case Type)
 
 ## Output Files
 
