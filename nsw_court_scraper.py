@@ -5,7 +5,6 @@ import logging
 import json
 import re
 import shutil
-from typing import Optional, List
 from enum import Enum
 import requests
 from bs4 import BeautifulSoup
@@ -108,11 +107,44 @@ class LLMExtractor:
              if "$" in data.case_description or "compensation" in data.decision_nature.lower():
                 data = self._call_llm(text, highlights, retry_mode=True)
             
-        return data.model_dump()
+        return data.model_dump(mode="json")
+
+    def _extract_relevant_sections(self, text):
+        keywords = [
+            "Orders",
+            "Conclusion",
+            "Decision",
+            "Findings",
+            "Reasons",
+        ]
+        lowered = text.lower()
+        segments = []
+        for keyword in keywords:
+            index = lowered.rfind(keyword.lower())
+            if index != -1:
+                start = max(0, index - 8000)
+                end = min(len(text), index + 12000)
+                segments.append(text[start:end].strip())
+
+        intro = text[:20000].strip()
+        if intro:
+            segments.insert(0, intro)
+
+        seen = set()
+        unique_segments = []
+        for segment in segments:
+            if segment and segment not in seen:
+                seen.add(segment)
+                unique_segments.append(segment)
+
+        combined = "\n\n...[SECTION BREAK]...\n\n".join(unique_segments)
+        if len(combined) > self.SINGLE_PASS_LIMIT_CHARS:
+            combined = combined[:self.SINGLE_PASS_LIMIT_CHARS]
+        return combined
 
     def _call_llm(self, text, highlights, retry_mode=False):
         if len(text) > self.SINGLE_PASS_LIMIT_CHARS:
-            processed_text = text[:50000] + "\n...[SNIP]...\n" + text[-50000:]
+            processed_text = self._extract_relevant_sections(text)
         else:
             processed_text = text
 
@@ -173,10 +205,10 @@ class LLMExtractor:
     def _get_empty_schema(self):
         return {
             "applicant_name": "", "respondent_name": "", 
-            "claimant_outcome": ClaimantOutcomeEnum.AGAINST_CLAIMANT, 
-            "case_type": CaseCategoryEnum.OTHER,
+            "claimant_outcome": ClaimantOutcomeEnum.AGAINST_CLAIMANT.value, 
+            "case_type": CaseCategoryEnum.OTHER.value,
             "impairment_percentage": "", "lump_sum_amount": "", "weekly_benefit_amount": "",
-            "medical_costs_awarded": MedicalCostsEnum.NA,
+            "medical_costs_awarded": MedicalCostsEnum.NA.value,
             "decision_nature": "Unknown", "decision_result": "Unknown", "case_description": "Not found",
             "date_of_injury": "", "date_of_decision": "", "jurisdiction": "NSW"
         }
@@ -203,6 +235,10 @@ class DecisionScraper:
         self.cache_file = "processed_cache.json"
         self.cache_lock = Lock() # Thread lock for cache operations
         self.cache = self._load_cache()
+        self.rate_limit_lock = Lock()
+        self.rate_limit_triggered = False
+        self.next_request_time = 0.0
+        self.rate_limit_delay = float(os.getenv("AUSTLII_RATE_LIMIT_DELAY", "5"))
         
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
@@ -246,8 +282,22 @@ class DecisionScraper:
         with self.cache_lock:
             self.cache[url] = data
 
+    def _throttle_if_rate_limited(self):
+        if not self.rate_limit_triggered:
+            return
+        delay = max(self.rate_limit_delay, 0)
+        if delay == 0:
+            return
+        with self.rate_limit_lock:
+            now = time.monotonic()
+            if now < self.next_request_time:
+                time.sleep(self.next_request_time - now)
+                now = time.monotonic()
+            self.next_request_time = now + delay
+
     def _make_request_with_retry(self, url, max_retries=5):
         for attempt in range(max_retries):
+            self._throttle_if_rate_limited()
             try:
                 response = requests.get(url, headers=self.headers, timeout=30)
                 
@@ -255,6 +305,8 @@ class DecisionScraper:
                     return response
                 
                 if response.status_code in [403, 429, 500, 502, 503, 504]:
+                    if response.status_code in [403, 429]:
+                        self.rate_limit_triggered = True
                     sleep_time = (2 ** attempt) + random.uniform(0, 1)
                     logging.warning(f"Request failed ({response.status_code}) for {url}. Retrying in {sleep_time:.2f}s...")
                     time.sleep(sleep_time)
@@ -299,9 +351,16 @@ class DecisionScraper:
         return [(title, url) for url, title in unique_links.items()]
 
     def process_decision(self, title, url):
+        if not self.extractor:
+            raise RuntimeError("LLM extractor is not configured. Ensure OPENAI_API_KEY is set.")
         safe_title = re.sub(r'[^\w\s\-\.]', '', title)
         safe_title = re.sub(r'[\s]+', '_', safe_title)
-        safe_title = safe_title[:100] + ".html"
+        case_id_match = re.search(r"/NSWPIC/(\d{4})/(\d+)\.html", url)
+        case_id = None
+        if case_id_match:
+            case_id = f"{case_id_match.group(1)}_{case_id_match.group(2)}"
+        suffix = f"_{case_id}" if case_id else "_unknown_case"
+        safe_title = f"{safe_title[:100]}{suffix}.html"
         
         log_title = (title[:75] + '...') if len(title) > 75 else title
 
@@ -363,20 +422,21 @@ def main():
         logging.warning("⚠️ OPENAI_API_KEY not found in .env file.")
         return
 
-    BASE_DOMAIN = "http://www.austlii.edu.au"
+    BASE_DOMAIN = "https://www.austlii.edu.au"
     OUTPUT_DIR = "nsw_pic_decisions"
     CSV_REPORT = "detailed_payout_summary.csv"
     scraper = DecisionScraper(BASE_DOMAIN, OUTPUT_DIR, api_key)
+    index_delay_seconds = float(os.getenv("AUSTLII_INDEX_DELAY", "2"))
     
     years = list(range(2021, datetime.datetime.now().year + 1))
     all_links = []
 
     for year in years:
-        index_url = f"http://www.austlii.edu.au/cgi-bin/viewdb/au/cases/nsw/NSWPIC/{year}/"
+        index_url = f"https://www.austlii.edu.au/cgi-bin/viewdb/au/cases/nsw/NSWPIC/{year}/"
         logging.info(f"Scanning Year: {year} ...")
         links = scraper.get_decision_links(index_url)
         all_links.extend(links)
-        time.sleep(2)
+        time.sleep(max(index_delay_seconds, 0))
 
     logging.info(f"Total decisions found (2021-Present): {len(all_links)}")
     

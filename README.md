@@ -127,6 +127,8 @@ You can modify these settings in `nsw_court_scraper.py`:
 - **ThreadPoolExecutor max_workers**: Adjust the number of parallel threads (default: 10)
 - **Retry settings**: Adjust `max_retries` in `_make_request_with_retry()` (default: 5)
 - **Cache save frequency**: Change the interval in `main()` where cache is saved (currently every 20 completions)
+- **AUSTLII_INDEX_DELAY**: Seconds to wait between index page requests (default: 2)
+- **AUSTLII_RATE_LIMIT_DELAY**: Seconds to throttle decision requests after rate limiting is detected (default: 5)
 
 ## Important Notes
 
@@ -217,4 +219,3 @@ This project is provided as-is for educational and research purposes. Please res
 ## Contributing
 
 Feel free to submit issues or pull requests for improvements.
-
