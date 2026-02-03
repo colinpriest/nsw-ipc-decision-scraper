@@ -442,10 +442,10 @@ def main():
     
     target_links = all_links 
     
-    logging.info(f"Starting parallel processing of {len(target_links)} decisions (10 threads)...")
+    logging.info(f"Starting parallel processing of {len(target_links)} decisions (5 threads)...")
     results = []
-    
-    with ThreadPoolExecutor(max_workers=10) as executor:
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
         future_to_url = {executor.submit(scraper.process_decision, title, url): url for title, url in target_links}
         
         for i, future in enumerate(as_completed(future_to_url)):
@@ -492,10 +492,23 @@ def print_summary(all_data):
     injury_dates = defaultdict(list)
     decision_dates = defaultdict(list)
 
+    def _has_numeric_value(val):
+        """Check if a value is a non-empty numeric string."""
+        if not val or not isinstance(val, str):
+            return False
+        val = val.strip()
+        if not val or val.lower() in ("n/a", "unknown", "none", "nan"):
+            return False
+        try:
+            float(val)
+            return True
+        except ValueError:
+            return False
+
     for row in all_data:
         case_type = row.get("Case Type") or "Unknown"
-        has_lump = bool(row.get("Lump Sum", "").strip())
-        has_impairment = bool(row.get("Impairment %", "").strip())
+        has_lump = _has_numeric_value(row.get("Lump Sum", ""))
+        has_impairment = _has_numeric_value(row.get("Impairment %", ""))
 
         if has_lump:
             lump_sum_counts[case_type] += 1
