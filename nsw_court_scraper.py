@@ -17,6 +17,7 @@ import datetime
 import random
 from threading import Lock
 from collections import defaultdict
+import hashlib
 
 # Configure logging
 logging.basicConfig(
@@ -91,23 +92,23 @@ class LLMExtractor:
             highlights.append(f"...{text[start:end].strip()}...")
         return "\n".join(highlights[:5])
 
-    def extract_data(self, text):
+    def extract_data(self, text, context=None):
         if not text:
-            return self._get_empty_schema()
+            return self._get_empty_schema(), None
             
         highlights = self._get_financial_highlights(text)
-        data = self._call_llm(text, highlights)
+        data, error = self._call_llm(text, highlights, context=context)
         
         # Retry logic
-        if data.claimant_outcome == ClaimantOutcomeEnum.FOR_CLAIMANT and \
+        if not error and data.claimant_outcome == ClaimantOutcomeEnum.FOR_CLAIMANT and \
            not data.lump_sum_amount and \
            not data.weekly_benefit_amount and \
            data.medical_costs_awarded == MedicalCostsEnum.NO:
-             
-             if "$" in data.case_description or "compensation" in data.decision_nature.lower():
-                data = self._call_llm(text, highlights, retry_mode=True)
+
+            if "$" in data.case_description or "compensation" in data.decision_nature.lower():
+                data, error = self._call_llm(text, highlights, retry_mode=True, context=context)
             
-        return data.model_dump(mode="json")
+        return data.model_dump(mode="json"), error
 
     def _extract_relevant_sections(self, text):
         keywords = [
@@ -142,7 +143,7 @@ class LLMExtractor:
             combined = combined[:self.SINGLE_PASS_LIMIT_CHARS]
         return combined
 
-    def _call_llm(self, text, highlights, retry_mode=False):
+    def _call_llm(self, text, highlights, retry_mode=False, context=None):
         if len(text) > self.SINGLE_PASS_LIMIT_CHARS:
             processed_text = self._extract_relevant_sections(text)
         else:
@@ -188,10 +189,11 @@ class LLMExtractor:
                 ],
                 response_format=DecisionSchema,
             )
-            return completion.choices[0].message.parsed
+            return completion.choices[0].message.parsed, None
             
         except Exception as e:
-            logging.error(f"LLM Error: {e}")
+            context_msg = f" ({context})" if context else ""
+            logging.error(f"LLM Error{context_msg}: {e}")
             return DecisionSchema(
                 applicant_name="Error", respondent_name="Error", 
                 claimant_outcome=ClaimantOutcomeEnum.AGAINST_CLAIMANT, 
@@ -200,7 +202,7 @@ class LLMExtractor:
                 medical_costs_awarded=MedicalCostsEnum.NA,
                 decision_nature="Error", decision_result="Error", case_description="Failed extraction", 
                 date_of_injury="", date_of_decision="", jurisdiction=JurisdictionEnum.NSW
-            )
+            ), str(e)
 
     def _get_empty_schema(self):
         return {
@@ -239,6 +241,8 @@ class DecisionScraper:
         self.rate_limit_triggered = False
         self.next_request_time = 0.0
         self.rate_limit_delay = float(os.getenv("AUSTLII_RATE_LIMIT_DELAY", "5"))
+        self.rate_limit_success_count = 0
+        self.rate_limit_reset_threshold = int(os.getenv("AUSTLII_RATE_LIMIT_RESET_THRESHOLD", "3"))
         
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
@@ -259,7 +263,7 @@ class DecisionScraper:
                 return {}
         return {}
 
-    def _save_cache(self):
+    def _save_cache(self, max_retries=3):
         """
         Thread-safe atomic write.
         Copies cache under lock, dumps to temp file, then renames.
@@ -269,13 +273,17 @@ class DecisionScraper:
         # Create a thread-safe snapshot of the data
         with self.cache_lock:
             cache_copy = self.cache.copy()
-            
-        try:
-            with open(temp_file, 'w') as f:
-                json.dump(cache_copy, f, indent=2, default=str)
-            os.replace(temp_file, self.cache_file)
-        except Exception as e:
-            logging.error(f"Failed to save cache: {e}")
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                with open(temp_file, 'w') as f:
+                    json.dump(cache_copy, f, indent=2, default=str)
+                os.replace(temp_file, self.cache_file)
+                return True
+            except Exception as e:
+                logging.error(f"Failed to save cache (attempt {attempt}/{max_retries}): {e}")
+                time.sleep(min(2 ** attempt, 5))
+        return False
 
     def update_cache(self, url, data):
         """Thread-safe cache update helper"""
@@ -283,12 +291,12 @@ class DecisionScraper:
             self.cache[url] = data
 
     def _throttle_if_rate_limited(self):
-        if not self.rate_limit_triggered:
-            return
         delay = max(self.rate_limit_delay, 0)
         if delay == 0:
             return
         with self.rate_limit_lock:
+            if not self.rate_limit_triggered:
+                return
             now = time.monotonic()
             if now < self.next_request_time:
                 time.sleep(self.next_request_time - now)
@@ -302,11 +310,20 @@ class DecisionScraper:
                 response = requests.get(url, headers=self.headers, timeout=30)
                 
                 if response.status_code == 200:
+                    with self.rate_limit_lock:
+                        if self.rate_limit_triggered:
+                            self.rate_limit_success_count += 1
+                            if self.rate_limit_success_count >= self.rate_limit_reset_threshold:
+                                self.rate_limit_triggered = False
+                                self.rate_limit_success_count = 0
+                                self.next_request_time = 0.0
                     return response
                 
                 if response.status_code in [403, 429, 500, 502, 503, 504]:
                     if response.status_code in [403, 429]:
-                        self.rate_limit_triggered = True
+                        with self.rate_limit_lock:
+                            self.rate_limit_triggered = True
+                            self.rate_limit_success_count = 0
                     sleep_time = (2 ** attempt) + random.uniform(0, 1)
                     logging.warning(f"Request failed ({response.status_code}) for {url}. Retrying in {sleep_time:.2f}s...")
                     time.sleep(sleep_time)
@@ -332,7 +349,8 @@ class DecisionScraper:
         soup = BeautifulSoup(response.content, 'html.parser')
         
         links = []
-        decision_url_pattern = re.compile(r"\/NSWPIC\/\d{4}\/\d+\.html")
+        decision_url_pattern = re.compile(r"\/NSWPIC\/\d{4}\/[^\/]+\.(?:html|pdf)", re.IGNORECASE)
+        nswpic_pattern = re.compile(r"\/NSWPIC\/\d{4}\/", re.IGNORECASE)
 
         for a in soup.find_all('a', href=True):
             href = a['href']
@@ -342,6 +360,8 @@ class DecisionScraper:
                 title = a.get_text(" ", strip=True)
                 if 5 < len(title) < 250:
                     links.append((title, full_url))
+            elif nswpic_pattern.search(full_url):
+                logging.warning(f"Potential decision link did not match expected pattern: {full_url}")
         
         unique_links = {}
         for title, url in links:
@@ -359,7 +379,11 @@ class DecisionScraper:
         case_id = None
         if case_id_match:
             case_id = f"{case_id_match.group(1)}_{case_id_match.group(2)}"
-        suffix = f"_{case_id}" if case_id else "_unknown_case"
+        if case_id:
+            suffix = f"_{case_id}"
+        else:
+            url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
+            suffix = f"_unknown_case_{url_hash}"
         safe_title = f"{safe_title[:100]}{suffix}.html"
         
         log_title = (title[:75] + '...') if len(title) > 75 else title
@@ -376,19 +400,77 @@ class DecisionScraper:
         if not response:
             logging.error(f"Failed to fetch content for {log_title} after retries.")
             return None
+
+        content_type = response.headers.get("Content-Type", "").lower()
+        if url.lower().endswith(".pdf") or (content_type and "text/html" not in content_type):
+            logging.warning(f"Non-HTML decision content skipped: {url}")
+            result_data = {
+                "Case Name": title,
+                "URL": url,
+                "File Saved": "",
+                "Jurisdiction": "",
+                "Case Type": "",
+                "Decision Date": "",
+                "Injury Date": "",
+                "Applicant": "",
+                "Respondent": "",
+                "Claimant Outcome": "",
+                "Impairment %": "",
+                "Lump Sum": "",
+                "Weekly Benefit": "",
+                "Medical Costs": "",
+                "Nature": "",
+                "Result": "",
+                "Description": "",
+                "Status": "skipped_non_html",
+                "LLM Error": "",
+            }
+            self.update_cache(url, result_data)
+            return result_data
             
-        full_path = os.path.join(self.output_folder, safe_title)
-        with open(full_path, 'wb') as f:
-            f.write(response.content)
-        
         decision_text = self.extractor.extract_text_from_html(response.content)
         
         if len(decision_text) < 500:
-            return None
+            logging.warning(f"Decision text too short; skipping {log_title}")
+            result_data = {
+                "Case Name": title,
+                "URL": url,
+                "File Saved": "",
+                "Jurisdiction": "",
+                "Case Type": "",
+                "Decision Date": "",
+                "Injury Date": "",
+                "Applicant": "",
+                "Respondent": "",
+                "Claimant Outcome": "",
+                "Impairment %": "",
+                "Lump Sum": "",
+                "Weekly Benefit": "",
+                "Medical Costs": "",
+                "Nature": "",
+                "Result": "",
+                "Description": "",
+                "Status": "skipped_short_text",
+                "LLM Error": "",
+            }
+            self.update_cache(url, result_data)
+            return result_data
+
+        full_path = os.path.join(self.output_folder, safe_title)
+        if os.path.exists(full_path):
+            url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
+            safe_title = f"{safe_title[:-5]}_{url_hash}.html"
+            full_path = os.path.join(self.output_folder, safe_title)
+        with open(full_path, 'wb') as f:
+            f.write(response.content)
 
         result_data = None
         if self.extractor:
-            llm_data = self.extractor.extract_data(decision_text)
+            llm_data, llm_error = self.extractor.extract_data(
+                decision_text,
+                context=f"title={log_title}, url={url}",
+            )
+            status = "ok" if not llm_error else "llm_error"
             
             result_data = {
                 "Case Name": title,
@@ -407,7 +489,9 @@ class DecisionScraper:
                 "Medical Costs": llm_data.get("medical_costs_awarded"),
                 "Nature": llm_data.get("decision_nature"),
                 "Result": llm_data.get("decision_result"),
-                "Description": llm_data.get("case_description")
+                "Description": llm_data.get("case_description"),
+                "Status": status,
+                "LLM Error": llm_error or ""
             }
             
             # Update cache safely
@@ -446,15 +530,22 @@ def main():
     results = []
 
     with ThreadPoolExecutor(max_workers=5) as executor:
-        future_to_url = {executor.submit(scraper.process_decision, title, url): url for title, url in target_links}
+        future_to_url = {
+            executor.submit(scraper.process_decision, title, url): url
+            for title, url in target_links
+        }
         
         for i, future in enumerate(as_completed(future_to_url)):
-            data = future.result()
-            if data:
-                results.append(data)
+            url = future_to_url[future]
+            try:
+                data = future.result()
+                if data:
+                    results.append(data)
+            except Exception as e:
+                logging.error(f"Unhandled exception while processing {url}: {e}")
             
             # Save cache periodically (e.g., every 20 completions)
-            if i > 0 and i % 20 == 0:
+            if i > 0 and i % 10 == 0:
                 scraper._save_cache()
     
     # Final save
@@ -470,7 +561,8 @@ def main():
         keys = [
             "Case Name", "URL", "File Saved", "Jurisdiction", "Case Type", "Decision Date", 
             "Injury Date", "Applicant", "Respondent", "Claimant Outcome", "Impairment %", 
-            "Lump Sum", "Weekly Benefit", "Medical Costs", "Nature", "Result", "Description"
+            "Lump Sum", "Weekly Benefit", "Medical Costs", "Nature", "Result", "Description",
+            "Status", "LLM Error"
         ]
         with open(CSV_REPORT, 'w', newline='', encoding='utf-8') as output_file:
             dict_writer = csv.DictWriter(output_file, fieldnames=keys)
