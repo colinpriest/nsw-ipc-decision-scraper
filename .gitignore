@@ -27,6 +27,10 @@ analysis_ready_payout_summary.csv
 # Claude Code local config
 .claude/
 
+# Local test scripts and their outputs
+test_*.py
+test_*_output.txt
+
 # Logs
 *.log
 scraper.log

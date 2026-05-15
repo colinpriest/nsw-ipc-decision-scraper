@@ -52,7 +52,7 @@ RESULT_FIELDS = [
     "Impairment %", "Lump Sum", "Weekly Benefit",
     "Non-Economic Loss", "Future Economic Loss", "Statutory Benefits",
     "Medical Costs",
-    "Nature", "Result", "Description",
+    "Nature", "Result", "Description", "Banded Description",
     # Ordinal scores
     "Injury Burden Intensity", "Psychological Injury Emphasis",
     "Liability Clarity", "Causation Complexity", "Treatment Burden",
@@ -67,12 +67,13 @@ RESULT_FIELDS = [
 
 # Keys stored on cached rows but excluded from the flat CSV output.
 SIDECAR_KEYS = (
-    "_narrative",          # dict of narrative sub-fields (incl. submissions)
-    "_slices",             # dict of catchwords / determinations / introduction
-    "_key_paragraphs",     # list of {paragraph_number, rationale, text}
-    "_event_history",      # list of {date, actor, tag}
+    "_narrative",            # dict of narrative sub-fields (incl. submissions)
+    "_slices",               # dict of catchwords / determinations / introduction
+    "_key_paragraphs",       # list of {paragraph_number, rationale, text}
+    "_event_history",        # list of {date, actor, tag}
     "_schema_version",
-    "_token_usage",        # last extraction's token usage
+    "_token_usage",          # last extraction's token usage
+    "_banding_validation",   # banded_case_description validation result
 )
 
 MODEL = "gpt-5"
@@ -279,6 +280,65 @@ class CombinedSchema(BaseModel):
         "straight quotes (not smart quotes), regular hyphens (not non-breaking or "
         "en/em-dashes), three dots (not ellipsis character)."
     ))
+    banded_case_description: str = Field(description=(
+        "A redacted version of case_description with numeric content REPLACED by "
+        "band tokens to prevent target leakage in downstream models. Same prose, "
+        "same paragraph, same anonymisation rules — only numbers change. "
+        "Single paragraph, no newlines, ASCII only.\n\n"
+        "REPLACE these categories with these EXACT tokens (lower-bound inclusive, "
+        "upper-bound inclusive; boundary values go to the LOWER band):\n\n"
+        "  CALENDAR DATES (any specific date like '22 July 2020', '9 July 2021', "
+        "'18-Nov-2020') -> [DATE]\n"
+        "  Keep relative durations VERBATIM: '12 weeks', '4 days per week', "
+        "'26 weeks', '3 years', 'about three weeks in hospital', 'nearly three "
+        "years'. These do not leak.\n\n"
+        "  CLAIMANT AGE (a stated age in years for the claimant):\n"
+        "    [AGE_BAND:<18]  [AGE_BAND:18-24]  [AGE_BAND:25-34]  [AGE_BAND:35-44]\n"
+        "    [AGE_BAND:45-54]  [AGE_BAND:55-64]  [AGE_BAND:65-74]  [AGE_BAND:75+]\n"
+        "  Examples: 'aged 59' -> 'aged [AGE_BAND:55-64]'; '21-year-old' -> "
+        "'[AGE_BAND:18-24]-year-old'; '64' -> '[AGE_BAND:55-64]'.\n\n"
+        "  WHOLE PERSON IMPAIRMENT % (WPI):\n"
+        "    [WPI_RANGE:0-5%]  [WPI_RANGE:6-10%]  [WPI_RANGE:11-15%]\n"
+        "    [WPI_RANGE:16-20%]  [WPI_RANGE:21-30%]  [WPI_RANGE:31-50%]  [WPI_RANGE:>50%]\n"
+        "  Examples: '11% WPI' -> '[WPI_RANGE:11-15%] WPI'; '7%' -> '[WPI_RANGE:6-10%]'.\n\n"
+        "  TOTAL PAYOUT / SETTLEMENT / DAMAGES AWARD (the total dollar amount):\n"
+        "    [PAYOUT_RANGE:<$50k]  [PAYOUT_RANGE:$50k-$150k]\n"
+        "    [PAYOUT_RANGE:$150k-$300k]  [PAYOUT_RANGE:$300k-$500k]\n"
+        "    [PAYOUT_RANGE:$500k-$1M]  [PAYOUT_RANGE:$1M-$2M]  [PAYOUT_RANGE:>$2M]\n"
+        "  Examples: '$350,000 total settlement' -> '[PAYOUT_RANGE:$300k-$500k] total settlement'.\n\n"
+        "  NON-ECONOMIC LOSS (pain and suffering damages component):\n"
+        "    [NEL_RANGE:<$50k]  [NEL_RANGE:$50k-$150k]\n"
+        "    [NEL_RANGE:$150k-$300k]  [NEL_RANGE:$300k-cap]\n"
+        "  Examples: '$300,000 for non-economic loss' -> '[NEL_RANGE:$150k-$300k] "
+        "for non-economic loss'.\n\n"
+        "  FUTURE ECONOMIC LOSS / BUFFER (future earnings, superannuation, treatment time):\n"
+        "    [FEL_RANGE:<$25k]  [FEL_RANGE:$25k-$75k]  [FEL_RANGE:$75k-$200k]\n"
+        "    [FEL_RANGE:$200k-$500k]  [FEL_RANGE:>$500k]\n"
+        "  Examples: '$50,000 future economic loss' -> '[FEL_RANGE:$25k-$75k] "
+        "future economic loss'; '$45,000 buffer' -> '[FEL_RANGE:$25k-$75k] buffer'; "
+        "'about $5,000 for superannuation' -> '[FEL_RANGE:<$25k] for superannuation'.\n\n"
+        "  WEEKLY INCOME (claimant's pre- or post-accident weekly employment income):\n"
+        "    [INCOME_WEEKLY:<$500]  [INCOME_WEEKLY:$500-$1000]\n"
+        "    [INCOME_WEEKLY:$1000-$1500]  [INCOME_WEEKLY:$1500-$2500]\n"
+        "    [INCOME_WEEKLY:>$2500]\n"
+        "  Examples: '$800 net per week' -> '[INCOME_WEEKLY:$500-$1000]'; "
+        "'PIAWE $1,134.68' -> 'PIAWE [INCOME_WEEKLY:$1000-$1500]'.\n\n"
+        "  MONTHLY COMMISSION (variable monthly commission / bonus income):\n"
+        "    [COMMISSION_MONTHLY:<$1k]  [COMMISSION_MONTHLY:$1k-$5k]\n"
+        "    [COMMISSION_MONTHLY:$5k-$10k]  [COMMISSION_MONTHLY:>$10k]\n"
+        "  Examples: '$4,000 per month commissions' -> '[COMMISSION_MONTHLY:$1k-$5k] "
+        "per month commissions'.\n\n"
+        "  REGULATED COSTS ORDERS (e.g. $3,762 regulated costs) -> use PAYOUT_RANGE.\n\n"
+        "PRESERVE VERBATIM (do NOT band): statutory section numbers ('s 60', "
+        "'section 3.11(1)', 's 6.25'); neutral case citations ('[2022] NSWPIC "
+        "137', '[2008] NSWCA 246'); paragraph numbers ('para 64'); relative "
+        "durations ('12 weeks', '4 days per week', '26 weeks'); counts ('83 "
+        "questions', 'four days per week'); year-only references inside Act names "
+        "('Workers Compensation Act 1987'); footnote markers ('[1]').\n\n"
+        "Any other numeric value (e.g. number of doctors, hospital admission "
+        "length in weeks, advisory speed signs) may stay verbatim if it doesn't "
+        "fit a banding category."
+    ))
 
     # ---- Narrative sub-fields ----
     claimant_profile: str = Field(description="Age, gender, occupation, employer, pre-injury health, prior claims. 60-150 words. 'Not stated' for unstated details.")
@@ -416,6 +476,239 @@ def find_slice(source, start_marker, end_marker):
     return source[sm.start():em.end()], (sm.start(), em.end()), None
 
 
+# ----------------------------------------------------------------------
+# Banding validation
+# ----------------------------------------------------------------------
+#
+# Band definitions mirror the schema description in CombinedSchema.banded_case_description.
+# Convention: lower-bound inclusive, upper-bound inclusive. Boundary values
+# go to the LOWER band (e.g. exactly 11% WPI -> "11-15%", not "6-10%"; exactly
+# 300000 NEL -> "$150k-$300k", not "$300k-cap").
+
+AGE_BANDS = [
+    (0, 17, "<18"),
+    (18, 24, "18-24"),
+    (25, 34, "25-34"),
+    (35, 44, "35-44"),
+    (45, 54, "45-54"),
+    (55, 64, "55-64"),
+    (65, 74, "65-74"),
+    (75, 200, "75+"),
+]
+WPI_BANDS = [
+    (0, 5, "0-5%"),
+    (6, 10, "6-10%"),
+    (11, 15, "11-15%"),
+    (16, 20, "16-20%"),
+    (21, 30, "21-30%"),
+    (31, 50, "31-50%"),
+    (51, 200, ">50%"),
+]
+PAYOUT_BANDS = [
+    (0, 50_000, "<$50k"),
+    (50_000, 150_000, "$50k-$150k"),
+    (150_000, 300_000, "$150k-$300k"),
+    (300_000, 500_000, "$300k-$500k"),
+    (500_000, 1_000_000, "$500k-$1M"),
+    (1_000_000, 2_000_000, "$1M-$2M"),
+    (2_000_000, 10**15, ">$2M"),
+]
+NEL_BANDS = [
+    (0, 50_000, "<$50k"),
+    (50_000, 150_000, "$50k-$150k"),
+    (150_000, 300_000, "$150k-$300k"),
+    (300_000, 10**15, "$300k-cap"),
+]
+FEL_BANDS = [
+    (0, 25_000, "<$25k"),
+    (25_000, 75_000, "$25k-$75k"),
+    (75_000, 200_000, "$75k-$200k"),
+    (200_000, 500_000, "$200k-$500k"),
+    (500_000, 10**15, ">$500k"),
+]
+INCOME_WEEKLY_BANDS = [
+    (0, 500, "<$500"),
+    (500, 1000, "$500-$1000"),
+    (1000, 1500, "$1000-$1500"),
+    (1500, 2500, "$1500-$2500"),
+    (2500, 10**15, ">$2500"),
+]
+COMMISSION_MONTHLY_BANDS = [
+    (0, 1000, "<$1k"),
+    (1000, 5000, "$1k-$5k"),
+    (5000, 10_000, "$5k-$10k"),
+    (10_000, 10**15, ">$10k"),
+]
+
+
+def _band_for(value, bands):
+    for low, high, label in bands:
+        if low <= value <= high:
+            return label
+    return None
+
+
+def _parse_money(s):
+    if not s or not isinstance(s, str):
+        return None
+    s = s.strip()
+    if not s or s.lower() in ("not stated", "not applicable", "not addressed", "nil", "n/a", "unknown"):
+        return None
+    # Strip $ and commas; take first numeric token
+    s = s.replace("$", "").replace(",", "")
+    m = re.search(r"-?\d+(?:\.\d+)?", s)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except ValueError:
+        return None
+
+
+def _parse_pct(s):
+    if not s or not isinstance(s, str):
+        return None
+    s = s.strip().rstrip("%").strip()
+    if not s or s.lower() in ("not stated", "not applicable", "n/a", "unknown"):
+        return None
+    m = re.search(r"-?\d+(?:\.\d+)?", s)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except ValueError:
+        return None
+
+
+def _parse_age(s):
+    if not s or not isinstance(s, str):
+        return None
+    m = re.search(r"\b(\d{1,3})\b", s)
+    if not m:
+        return None
+    age = int(m.group(1))
+    return age if 0 < age < 120 else None
+
+
+_BAND_TOKEN_KINDS = (
+    "AGE_BAND", "WPI_RANGE", "PAYOUT_RANGE", "NEL_RANGE",
+    "FEL_RANGE", "INCOME_WEEKLY", "COMMISSION_MONTHLY", "DATE",
+)
+_BAND_TOKEN_RE = re.compile(
+    r"\[(?:" + "|".join(_BAND_TOKEN_KINDS) + r")(?::[^\]]*)?\]"
+)
+
+
+def validate_banding(banded_text, record=None):
+    """
+    Validate that `banded_text` (the value of banded_case_description) does
+    not leak target numerics and that any band tokens it does use are
+    consistent with the structured numeric fields on `record` (when supplied).
+
+    Returns: {
+        "ok": bool,
+        "tokens": {token_kind: count, ...},
+        "issues": [{"type": str, "severity": "high"|"medium"|"low", "match": str|None, "detail": str|None}, ...],
+    }
+    """
+    if not banded_text:
+        return {"ok": False, "tokens": {}, "issues": [{"type": "empty", "severity": "high"}]}
+
+    issues = []
+
+    # Token counts
+    tokens = {kind: 0 for kind in _BAND_TOKEN_KINDS}
+    for kind in _BAND_TOKEN_KINDS:
+        tokens[kind] = len(re.findall(r"\[" + kind + r"(?::|\])", banded_text))
+
+    # Strip all band tokens so residual checks don't match inside them
+    stripped = _BAND_TOKEN_RE.sub("", banded_text)
+
+    # --- Residual leakage checks ---
+    for m in re.finditer(r"\$\s?[\d,]+(?:\.\d+)?(?:\s*(?:million|m|k|K))?", stripped):
+        issues.append({"type": "residual_currency", "severity": "high",
+                       "match": m.group(0).strip(), "detail": None})
+    for m in re.finditer(
+        r"\b\d{1,2}\s+(?:January|February|March|April|May|June|July|"
+        r"August|September|October|November|December)\s+\d{4}\b",
+        stripped,
+    ):
+        issues.append({"type": "residual_date", "severity": "high",
+                       "match": m.group(0).strip(), "detail": None})
+    for m in re.finditer(
+        r"\b\d{1,2}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{4}\b",
+        stripped,
+    ):
+        issues.append({"type": "residual_date", "severity": "high",
+                       "match": m.group(0).strip(), "detail": None})
+    for m in re.finditer(r"\b\d{4}-\d{2}-\d{2}\b", stripped):
+        issues.append({"type": "residual_date", "severity": "high",
+                       "match": m.group(0).strip(), "detail": None})
+    for m in re.finditer(r"\baged?\s+(\d{1,3})\b", stripped, re.IGNORECASE):
+        age = int(m.group(1))
+        if 0 < age < 120:
+            issues.append({"type": "residual_age", "severity": "high",
+                           "match": m.group(0).strip(), "detail": None})
+    for m in re.finditer(r"\b(\d{1,3})[-\s]year[-\s]old\b", stripped, re.IGNORECASE):
+        age = int(m.group(1))
+        if 0 < age < 120:
+            issues.append({"type": "residual_age", "severity": "high",
+                           "match": m.group(0).strip(), "detail": None})
+    for m in re.finditer(
+        r"\b(\d{1,2})\s*%\s*(?:WPI|whole\s*person\s*impairment|permanent\s*impairment)\b",
+        stripped, re.IGNORECASE,
+    ):
+        issues.append({"type": "residual_wpi", "severity": "high",
+                       "match": m.group(0).strip(), "detail": None})
+
+    # --- Cross-check band tokens against structured numeric fields ---
+    if record:
+        checks = [
+            ("WPI_RANGE", "Impairment %",          _parse_pct,   WPI_BANDS,             "wpi"),
+            ("PAYOUT_RANGE", "Lump Sum",           _parse_money, PAYOUT_BANDS,          "payout"),
+            ("NEL_RANGE", "Non-Economic Loss",     _parse_money, NEL_BANDS,             "nel"),
+            ("FEL_RANGE", "Future Economic Loss",  _parse_money, FEL_BANDS,             "fel"),
+            ("INCOME_WEEKLY", "Claimant Weekly Income", _parse_money, INCOME_WEEKLY_BANDS, "income"),
+            ("COMMISSION_MONTHLY", None,           None,         COMMISSION_MONTHLY_BANDS, "commission"),
+            ("AGE_BAND", "Claimant Age",           _parse_age,   AGE_BANDS,             "age"),
+        ]
+        for kind, field_name, parser, bands, label in checks:
+            if field_name is None or parser is None:
+                continue
+            structured_val = parser(record.get(field_name, ""))
+            used_tokens = re.findall(r"\[" + kind + r":([^\]]+)\]", banded_text)
+            if structured_val is None or not used_tokens:
+                continue
+            # Skip when components are split across multiple band tokens of
+            # the same kind — the structured field is the SUM, which won't
+            # equal any single component band (e.g. FEL $45k buffer + $5k
+            # super -> two FEL_RANGE tokens; structured FEL = $50k total).
+            if len(used_tokens) > 1:
+                continue
+            # Skip INCOME_WEEKLY cross-check when commissions are banded
+            # separately — structured Weekly Income includes commission, but
+            # INCOME_WEEKLY token alone represents just the base salary.
+            if kind == "INCOME_WEEKLY" and tokens.get("COMMISSION_MONTHLY", 0) > 0:
+                continue
+            expected = _band_for(structured_val, bands)
+            if expected is None:
+                continue
+            if not any(expected == t for t in used_tokens):
+                issues.append({
+                    "type": f"{label}_band_mismatch",
+                    "severity": "medium",
+                    "match": None,
+                    "detail": f"{field_name}={structured_val}; expected {kind} band '{expected}'; "
+                              f"banded text used {used_tokens}",
+                })
+
+    return {
+        "ok": not issues,
+        "tokens": tokens,
+        "issues": issues,
+    }
+
+
 def extract_html_with_paragraph_numbers(html_bytes):
     """
     NSWPIC HTML uses <ol><li value="N"> for numbered paragraphs; BS4's
@@ -512,6 +805,13 @@ Personal Injury Commission decision. Produce one structured response with:
     hospital'. Cited case authorities and statutory references ARE preserved.
     Use ASCII only (straight quotes, regular hyphens, three dots — no smart
     quotes, em-dashes, non-breaking hyphens, ellipsis character).
+
+    Also produce BANDED_CASE_DESCRIPTION: the same paragraph with numeric
+    target-leaking content replaced by band tokens per the rules in the
+    schema field description (dates -> [DATE]; ages -> [AGE_BAND:...];
+    WPI -> [WPI_RANGE:...]; payouts/NEL/FEL/income/commissions -> their
+    respective range tokens). Same prose otherwise. Same anonymisation
+    rules. Relative durations and section numbers stay verbatim.
 
 (3) NARRATIVE SUB-FIELDS — 60-150 words each. If a fact is not stated in the
     source, write 'Not stated' for that detail rather than omitting it.
@@ -723,6 +1023,7 @@ class DecisionScraper:
                     "event_history": row.get("_event_history", []),
                     "regulatory_sections": (row.get("Regulatory Sections") or "").split(" | "),
                     "token_usage": row.get("_token_usage", {}),
+                    "banding_validation": row.get("_banding_validation", {}),
                 }
                 sidecar[url] = entry
 
@@ -906,6 +1207,7 @@ class DecisionScraper:
 
     def _build_record_from_parsed(self, *, title, url, file_saved, parsed, decision_text, token_usage):
         sanitised_case_description = sanitise_case_description(parsed.case_description)
+        sanitised_banded_description = sanitise_case_description(parsed.banded_case_description)
 
         # Resolve slices against the cleaned source.
         slices = {}
@@ -980,6 +1282,7 @@ class DecisionScraper:
             "Nature": parsed.decision_nature,
             "Result": parsed.decision_result,
             "Description": sanitised_case_description,
+            "Banded Description": sanitised_banded_description,
             "Injury Burden Intensity": parsed.injury_burden_intensity,
             "Psychological Injury Emphasis": parsed.psychological_injury_emphasis,
             "Liability Clarity": parsed.liability_clarity,
@@ -1000,6 +1303,7 @@ class DecisionScraper:
         result["_key_paragraphs"] = key_paragraphs
         result["_event_history"] = event_history
         result["_token_usage"] = token_usage
+        result["_banding_validation"] = validate_banding(sanitised_banded_description, record=result)
         return result
 
 def main():
