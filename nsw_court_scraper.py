@@ -214,15 +214,20 @@ class CombinedSchema(BaseModel):
     claimant_gender: str = Field(description="Claimant's gender if stated (Male / Female / Other / Not stated).")
     claimant_occupation: str = Field(description="Claimant's occupation at time of injury (e.g. 'bus driver', 'registered nurse', 'senior laboratory technician'). 'Not stated' if absent.")
     claimant_weekly_income: str = Field(description=(
-        "Claimant's weekly employment income as stated in the decision. Capture any "
-        "specific weekly figure mentioned — pre-injury (PIAWE), current/post-accident, "
-        "or at hearing. If multiple components are stated (e.g. base salary plus "
-        "commissions, or net plus super), include each. Add a short qualifier "
-        "indicating which period the figure applies to. Use nominal numbers with no "
-        "$ or commas. Examples: '1230.00 PIAWE', '800.00 net per week plus approx "
-        "4000.00 per month commissions (current, post-accident)', '461.16 current "
-        "weekly earnings; PIAWE 1134.68'. 'Not stated' only if NO weekly income "
-        "figure of any kind appears."
+        "A SINGLE NOMINAL NUMBER representing the claimant's total weekly "
+        "employment income (e.g. '1722.08'). NO words, NO commentary, NO "
+        "qualifiers, NO $ or commas — just digits and one decimal point.\n"
+        "Conversion rules:\n"
+        "  - If only a weekly figure is stated, use it.\n"
+        "  - If components are stated separately (e.g. salary plus commissions, "
+        "or hourly plus hours), normalise to a TOTAL WEEKLY number: monthly / "
+        "(52/12), annual / 52, hourly * weekly_hours, etc. Sum all components.\n"
+        "  - If both pre-injury (PIAWE) and current/post-accident figures are "
+        "stated, prefer the PRE-INJURY figure (it represents the claimant's "
+        "earning capacity before the injury).\n"
+        "  - If net and gross are both stated, prefer GROSS.\n"
+        "Use 'Not stated' (literally) only if NO weekly-or-convertible income "
+        "figure of any kind appears in the decision."
     ))
     employer_name: str = Field(description="Employer's legal name (workers compensation only). 'Not applicable' for CTP / non-employment cases. 'Not stated' if WC case but employer not named.")
     location_of_accident_or_injury: str = Field(description="Where the injury occurred — for CTP: road/intersection/town; for WC: workplace address/town. 'Not stated' if absent.")
