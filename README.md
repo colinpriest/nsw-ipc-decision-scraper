@@ -7,9 +7,11 @@ A Python tool that scrapes NSW Personal Injury Commission (NSWPIC) decisions fro
 ## Features
 
 - **Automated Scraping**: Fetches court decisions from AustLII NSWPIC index
+- **HTML and PDF Support**: Extracts text from both HTML and PDF decisions
 - **AI-Powered Extraction**: Uses GPT-4o with structured output (Pydantic) to extract detailed case information
 - **Intelligent Caching**: Caches extracted data to avoid re-processing decisions
-- **Parallel Processing**: Processes multiple decisions concurrently (10 threads) for faster execution
+- **Parallel Processing**: Processes multiple decisions concurrently (5 threads) for faster execution
+- **Analysis-Ready Filtering**: Flags rows that are unsuitable for analysis and exports a filtered report
 - **Comprehensive Data Extraction**: Extracts:
   - Applicant and Respondent names
   - Claimant outcome (For/Against Claimant)
@@ -53,9 +55,10 @@ The script will:
 1. Fetch the list of decisions from AustLII NSWPIC indexes for years 2021 to present
 2. Process each decision (using cached data when available)
 3. Save HTML files to `nsw_pic_decisions/`
-4. Generate a CSV report: `detailed_payout_summary.csv`
-5. Update the cache file: `processed_cache.json` (saved periodically during processing)
-6. Print a data summary to the console (counts of lump sums, impairment percentages, and date ranges, split by Case Type)
+4. Generate a full CSV report: `detailed_payout_summary.csv`
+5. Generate an analysis-ready CSV report: `analysis_ready_payout_summary.csv`
+6. Update the cache file: `processed_cache.json` (saved periodically during processing)
+7. Print a data-quality summary plus an analysis-ready data summary to the console
 
 ## Output Files
 
@@ -78,6 +81,13 @@ A comprehensive CSV file containing all extracted data with columns:
 - Nature
 - Result
 - Description
+- Status
+- LLM Error
+- Analysis Ready
+- Analysis Exclusion Reason
+
+### `analysis_ready_payout_summary.csv`
+Filtered CSV export containing only rows that are suitable for downstream analysis. Rows are excluded if processing failed, the LLM extraction failed, or the decision date is missing/invalid.
 
 ### `nsw_pic_decisions/`
 Directory containing:
@@ -95,14 +105,14 @@ Log file containing execution details, errors, and processing status.
 
 ## How It Works
 
-1. **Multi-Year Index Scraping**: Fetches AustLII NSWPIC index pages for years 2021 to present, identifying decision links using regex pattern matching (`/NSWPIC/YYYY/NUMBER.html`)
+1. **Multi-Year Index Scraping**: Fetches AustLII NSWPIC index pages for years 2021 to present, identifying decision links using regex pattern matching (`/NSWPIC/YYYY/NUMBER.html` and PDF equivalents)
 
-2. **HTML Download with Retry Logic**: Downloads each decision's HTML file with exponential backoff retry logic:
+2. **Decision Download with Retry Logic**: Downloads each decision with exponential backoff retry logic:
    - Handles rate limiting (403, 429) and server errors (500, 502, 503, 504)
    - Retries connection errors and timeouts
    - Uses random jitter to avoid thundering herd problems
 
-3. **Text Extraction**: Extracts clean text from HTML, focusing on the main content area (article, document, or body)
+3. **Text Extraction**: Extracts clean text from HTML (focusing on the main content area) and PDF decisions
 
 4. **AI Extraction**: 
    - Uses GPT-4o with structured output via Pydantic models
@@ -116,9 +126,9 @@ Log file containing execution details, errors, and processing status.
    - Periodically saves cache every 20 completions to prevent data loss
    - Handles corrupted cache files by backing them up and starting fresh
 
-6. **Parallel Processing**: Uses ThreadPoolExecutor (10 workers) to process multiple decisions concurrently
+6. **Parallel Processing**: Uses ThreadPoolExecutor (5 workers) to process multiple decisions concurrently
 
-7. **CSV Generation**: Combines all cached and newly extracted data into a single CSV report, sorted by decision date
+7. **CSV Generation**: Writes a full audit CSV and a filtered analysis-ready CSV, both sorted by valid decision date
 
 ## Additional Scripts
 
@@ -128,6 +138,8 @@ A standalone filtering script that reads `detailed_payout_summary.csv` and produ
 ```bash
 python ctp_lump_sum_impairment.py
 ```
+
+This script prefers `analysis_ready_payout_summary.csv` when available, and falls back to `detailed_payout_summary.csv` while still filtering out rows that are not analysis-ready.
 
 This script requires `pandas` and `openpyxl` (included in `requirements.txt`).
 

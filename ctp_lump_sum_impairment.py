@@ -1,11 +1,17 @@
 import os
 import pandas as pd
 
-INPUT_CSV = "detailed_payout_summary.csv"
+INPUT_CSV_CANDIDATES = [
+    "analysis_ready_payout_summary.csv",
+    "detailed_payout_summary.csv",
+]
 OUTPUT_XLSX = "ctp_impairment_lump_sum.xlsx"
 
-if not os.path.exists(INPUT_CSV):
-    raise FileNotFoundError(f"Input CSV not found: {INPUT_CSV}")
+INPUT_CSV = next((path for path in INPUT_CSV_CANDIDATES if os.path.exists(path)), None)
+if not INPUT_CSV:
+    raise FileNotFoundError(
+        f"Input CSV not found. Checked: {', '.join(INPUT_CSV_CANDIDATES)}"
+    )
 
 df = pd.read_csv(INPUT_CSV, dtype=str)
 df = df.fillna("")
@@ -30,8 +36,28 @@ def is_numeric(series):
     return series.apply(_check)
 
 
+def is_analysis_ready(dataframe):
+    """Return boolean mask for rows suitable for downstream analysis."""
+    if "Analysis Ready" in dataframe.columns:
+        return dataframe["Analysis Ready"].astype(str).str.strip().eq("Yes")
+
+    if "Status" in dataframe.columns:
+        status_ok = dataframe["Status"].astype(str).str.strip().eq("ok")
+    else:
+        status_ok = pd.Series(True, index=dataframe.index)
+
+    if "LLM Error" in dataframe.columns:
+        llm_ok = dataframe["LLM Error"].astype(str).str.strip().eq("")
+    else:
+        llm_ok = pd.Series(True, index=dataframe.index)
+
+    has_decision_date = dataframe["Decision Date"].astype(str).str.strip().str.fullmatch(r"\d{4}-\d{2}-\d{2}")
+    return status_ok & llm_ok & has_decision_date
+
+
 filtered = df[
-    (df["Case Type"] == "CTP")
+    is_analysis_ready(df)
+    & (df["Case Type"] == "CTP")
     & is_numeric(df["Impairment %"])
     & is_numeric(df["Lump Sum"])
 ]

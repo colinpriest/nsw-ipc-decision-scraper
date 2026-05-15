@@ -15,8 +15,17 @@ ENV/
 
 # Cache and data files
 processed_cache.json
+processed_sidecar.json
 extraction_cache.json
 *.cache
+*.bak
+
+# Local analysis outputs (not source)
+ctp_impairment_lump_sum.xlsx
+analysis_ready_payout_summary.csv
+
+# Claude Code local config
+.claude/
 
 # Logs
 *.log
