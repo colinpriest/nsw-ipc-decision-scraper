@@ -1,0 +1,15 @@
+{
+  "https://www.austlii.edu.au/cgi-bin/viewdoc/au/cases/nsw/NSWPIC/2025/287.html": {
+    "url": "https://www.austlii.edu.au/cgi-bin/viewdoc/au/cases/nsw/NSWPIC/2025/287.html",
+    "case_name": "McMillan v Secretary, Department of Education [2025] NSWPIC 287",
+    "error_type": "html_no_content",
+    "first_detected_at": "2026-05-17T13:33:34",
+    "last_detected_at": "2026-05-17T15:03:09",
+    "detection_count": 2,
+    "local_file": "McMillan_v_Secretary_Department_of_Education_2025_NSWPIC_287_23_June_2025_2025_287.html",
+    "extracted_chars": 32,
+    "notes": "AustLII viewer rendered an empty <article class='the-document'> with 'No title / Can\\'t extract contents'. Decision listed in index but body is not served; needs manual review.",
+    "live_verified": true,
+    "resolved": false
+  }
+}

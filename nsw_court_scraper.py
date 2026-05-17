@@ -9,6 +9,7 @@ import shutil
 from enum import Enum
 from typing import List, Literal
 import requests
+from curl_cffi import requests as cf_requests
 from bs4 import BeautifulSoup, NavigableString
 from urllib.parse import urljoin
 from openai import OpenAI
@@ -52,7 +53,8 @@ RESULT_FIELDS = [
     "Impairment %", "Lump Sum", "Weekly Benefit",
     "Non-Economic Loss", "Future Economic Loss", "Statutory Benefits",
     "Medical Costs",
-    "Nature", "Result", "Description", "Banded Description",
+    "Nature", "Result", "Description", "Banded Description", "Catchwords",
+    "Impairment % (Accepted)",
     # Ordinal scores
     "Injury Burden Intensity", "Psychological Injury Emphasis",
     "Liability Clarity", "Causation Complexity", "Treatment Burden",
@@ -211,7 +213,14 @@ class CombinedSchema(BaseModel):
     respondent_name: str
     claimant_outcome: ClaimantOutcomeEnum
     case_type: CaseCategoryEnum
-    claimant_age: str = Field(description="Claimant's age at time of injury or hearing as stated (e.g. '47' or '21 at time of accident'). 'Not stated' if absent.")
+    claimant_age: str = Field(description=(
+        "Claimant's age. Prefer age at time of injury/accident. "
+        "Examples: '47', '21 at time of accident'. "
+        "If only year-of-birth is stated (e.g. 'born in 1995' or 'date of birth: "
+        "12 March 1995'), DERIVE the age = injury_year - birth_year and emit "
+        "the number (e.g. '28'). 'Not stated' only if neither an age nor a "
+        "year-of-birth can be found anywhere in the decision."
+    ))
     claimant_gender: str = Field(description="Claimant's gender if stated (Male / Female / Other / Not stated).")
     claimant_occupation: str = Field(description="Claimant's occupation at time of injury (e.g. 'bus driver', 'registered nurse', 'senior laboratory technician'). 'Not stated' if absent.")
     claimant_weekly_income: str = Field(description=(
@@ -232,7 +241,29 @@ class CombinedSchema(BaseModel):
     ))
     employer_name: str = Field(description="Employer's legal name (workers compensation only). 'Not applicable' for CTP / non-employment cases. 'Not stated' if WC case but employer not named.")
     location_of_accident_or_injury: str = Field(description="Where the injury occurred — for CTP: road/intersection/town; for WC: workplace address/town. 'Not stated' if absent.")
-    impairment_percentage: str = Field(description="Whole Person Impairment percentage ONLY if a final assessment is made (e.g. '15'). LEAVE EMPTY if the decision allows reassessment or remits to a medical assessor.")
+    impairment_percentage: str = Field(description=(
+        "Whole Person Impairment percentage when a binding assessment is made "
+        "IN THIS PROCEEDING (e.g. '15'). LEAVE EMPTY if the decision merely "
+        "accepts a prior Medical Assessor's certificate, or remits the matter "
+        "to a medical assessor, or allows reassessment. (This is the strict "
+        "'made-here' value — the lenient value goes in impairment_percentage_accepted.)"
+    ))
+    impairment_percentage_accepted: str = Field(description=(
+        "Whole Person Impairment percentage RELIED ON BY THE TRIBUNAL for the "
+        "award, regardless of whether the assessment was made in this proceeding "
+        "or in a prior MAS certificate that the Member accepts. For CTP "
+        "settlement approvals under MAI Act 2017 s 6.23 and damages assessments "
+        "under s 7.36, this is almost always present and is the WPI underpinning "
+        "the lump sum. Use the COMBINED / TOTAL value the Member relied on; if "
+        "multiple component WPIs are stated for different body parts and no "
+        "combined value, use the highest single value. EMPTY only if no numeric "
+        "WPI appears anywhere in the decision. "
+        "IMPORTANT: do NOT emit '0' as a WPI value — a true 0% finding is "
+        "extremely rare and would defeat the lump sum entitlement. Where the "
+        "source mentions '0%' it is almost always reciting the statutory "
+        "definition of a 'minor injury' or the threshold (s 1.6 / s 4.11). "
+        "Leave EMPTY in those cases."
+    ))
     lump_sum_amount: str = Field(description="Total lump sum awarded for COMPENSATION (s 66 WPI or settlement principal). Regulated costs orders do NOT belong here. Empty if none.")
     weekly_benefit_amount: str = Field(description="Weekly benefit amount as a NOMINAL NUMBER (e.g. '540.50'). If multiple periods, use the LATEST. NET amount if deductions quantified.")
     non_economic_loss: str = Field(description="Damages for non-economic loss (pain and suffering) as a nominal number. 'Not stated' if not addressed; 'Nil' if explicitly denied.")
@@ -411,6 +442,49 @@ def sanitise_case_description(text):
     return text
 
 
+# Match a non-negative number. We do NOT allow a leading "-" because none of
+# the LLM fields this coercer targets (age, money amounts, percentages) can
+# validly be negative. A leading "-" inside the input is always part of a
+# different token (e.g. the dash in "mid-80's" or a date like "12-Jan-2024"),
+# never a real sign on the value we want.
+_LEADING_NUM_RE = re.compile(r"\d+(?:\.\d+)?")
+_NON_NUMERIC_SENTINELS = {
+    "", "not stated", "not applicable", "n/a", "unknown",
+    "nil", "none", "not addressed",
+}
+
+
+def coerce_leading_number(val):
+    """Best-effort extraction of a non-negative numeric value from an
+    LLM-emitted string.
+
+    Returns "" for sentinels ('Not stated', etc.) and unparseable strings.
+    Otherwise returns the first non-negative number found, as a string
+    (e.g. '47', '47.5'). Examples:
+        '47'                            -> '47'
+        '21 at time of accident'        -> '21'
+        '55 at time of accident; 58 ...' -> '55' (at-accident value)
+        "mid-80's at time of approval"  -> '80'  (NOT '-80')
+        'Not stated'                    -> ''
+        'Late 20s'                      -> '20'
+        'Mid-80s'                       -> '80'
+    """
+    s = str(val or "").strip().replace("$", "").replace(",", "")
+    if s.lower() in _NON_NUMERIC_SENTINELS:
+        return ""
+    try:
+        f = float(s)
+        if f < 0:
+            return ""  # negative LLM output shouldn't happen; reject
+        return s
+    except ValueError:
+        pass
+    m = _LEADING_NUM_RE.search(s)
+    if not m:
+        return ""
+    return m.group(0)
+
+
 def cleanup_text(text):
     """
     Normalise whitespace from BS4 HTML extraction. Treat blank lines as
@@ -433,6 +507,130 @@ def cleanup_text(text):
 
 
 PARA_NUM_RE = re.compile(r"(?m)^(\d{1,3})\.\s+(?=\S)")
+
+# Whole Person Impairment extraction from decision text. Used to backfill the
+# Impairment % (Accepted) column when the main LLM left it empty because the
+# decision merely *accepted* a prior MAS certificate (common pattern for CTP
+# settlement approvals and damages assessments under MAI Act 2017).
+#
+# Strict-precision rule: only fill the field when the source contains exactly
+# ONE distinct WPI number. Cases with multiple component WPIs (e.g. "head 5%,
+# back 7%, total 12%") are deferred to focused LLM extraction — regex picking
+# the wrong component happens ~20% of the time, which is unacceptable.
+_WPI_FWD_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*%\s*"
+    r"(?:WPI\b|whole\s+person\s+impairment|permanent\s+impairment)",
+    re.IGNORECASE,
+)
+_WPI_REV_RE = re.compile(
+    r"(?:WPI\b|whole\s+person\s+impairment|permanent\s+impairment)"
+    r"\s*(?:of|at|assessed\s+at|certif(?:ied|icate)?\s*(?:as|of|at)?)?\s*"
+    r"(\d+(?:\.\d+)?)\s*%",
+    re.IGNORECASE,
+)
+
+
+def find_wpi_candidates(decision_text):
+    """Return the set of distinct WPI numbers (in [0,100]) found in the text."""
+    if not decision_text:
+        return set()
+    values = set()
+    for m in _WPI_FWD_RE.finditer(decision_text):
+        v = float(m.group(1))
+        if 0 <= v <= 100:
+            values.add(v)
+    for m in _WPI_REV_RE.finditer(decision_text):
+        v = float(m.group(1))
+        if 0 <= v <= 100:
+            values.add(v)
+    return values
+
+
+def extract_wpi_confident(decision_text):
+    """High-precision WPI from a decision's cleaned text.
+
+    Returns a single float when exactly one distinct NON-ZERO WPI number
+    appears in the source (~97% accuracy vs LLM on validation). Returns
+    None for zero or multiple distinct values, or when the only candidate
+    is 0 — '0% WPI' almost always comes from generic statutory framing
+    (definition of minor injury, the s 4.11 / s 1.6 threshold language),
+    not a finding about this claimant. A genuine 0% WPI claimant would
+    not be entitled to non-economic loss and rarely receives a lump sum.
+    """
+    vals = find_wpi_candidates(decision_text)
+    vals = {v for v in vals if v > 0}
+    if len(vals) == 1:
+        return next(iter(vals))
+    return None
+
+# AustLII NSWPIC decisions have a consistent "CATCHWORDS:" header followed by
+# a body that ends at the next section heading. Parse verbatim — no LLM. Used
+# as a ground-truth validation handle for the LLM-derived case description.
+#
+# Edge cases observed in the corpus:
+#  - Standard:  "CATCHWORDS:\n\n<body>\n\nDETERMINATIONS MADE:\n..."
+#  - Merged:    "CATCHWORDS: DETERMINATIONS MADE:\n\n<body>\n\n<next heading>"
+#               (AustLII rendering glitch — body still recoverable from below)
+#  - Lower-case next heading: "determinations made:" / "Reasons for Decision"
+#
+# Start: any line beginning with the literal "CATCHWORDS" (consume the rest
+# of that line so the merged-header glitch still works).
+# End: the next *known* section heading, case-insensitive. Using a known list
+# avoids false matches on catchwords-body fragments (e.g. lines ending in
+# "applied:" or "considered:").
+# Start: any line beginning with "CATCHWORD" or "CATCHWORDS" (singular form
+# observed in some 2022 cases).
+CATCHWORDS_START_RE = re.compile(r"(?im)^[ \t]*CATCHWORDS?\b.*$")
+CATCHWORDS_END_RE = re.compile(
+    r"(?im)^\s*(?:"
+    r"DETERMINATIONS?\s+MADE"
+    r"|ORDERS?\s+MADE"
+    r"|LEGISLATION\s+CITED"
+    r"|CASES?\s+CITED"
+    r"|REASONS?\s+FOR\s+(?:DECISION|JUDGMENT)"
+    r"|REASONS?\b"
+    r"|INTRODUCTION"
+    r"|BACKGROUND"
+    r"|ORDERS?"
+    r"|DECISION"
+    r"|DETERMINATION"
+    r"|FINDINGS"
+    r"|HEARING\s+DATES?"
+    r"|DATE\s+OF\s+(?:DECISION|HEARING)"
+    r"|CERTIFICATE\s+OF\s+DETERMINATION"
+    r"|SUMMARY\s+OF\s+(?:DECISION|ORDERS?)"
+    r"|INTERIM\s+PAYMENT\s+DIRECTION"
+    r")\s*:?\s*$"
+)
+# Defensive cap — observed catchwords body up to ~3100 chars in genuine cases.
+# >4000 means the end-anchor missed and we ran into the substantive body.
+CATCHWORDS_MAX_CHARS = 4000
+
+
+def extract_catchwords(decision_text):
+    """Pull the verbatim CATCHWORDS body from a NSWPIC decision text.
+
+    Returns the body string with leading/trailing whitespace trimmed and
+    internal paragraph breaks preserved. Returns "" if no CATCHWORDS header
+    is found (rare) or if the parsed body exceeds CATCHWORDS_MAX_CHARS (rarer
+    — indicates a malformed source where the end anchor is missing).
+    """
+    if not decision_text:
+        return ""
+    m = CATCHWORDS_START_RE.search(decision_text)
+    if not m:
+        return ""
+    start = m.end()
+    end_m = CATCHWORDS_END_RE.search(decision_text, start)
+    end = end_m.start() if end_m else len(decision_text)
+    body = decision_text[start:end].strip()
+    if len(body) > CATCHWORDS_MAX_CHARS:
+        logging.warning(
+            f"extract_catchwords: body length {len(body)} exceeds cap "
+            f"({CATCHWORDS_MAX_CHARS}); end anchor likely missed - returning empty"
+        )
+        return ""
+    return body
 
 
 def extract_numbered_paragraphs(cleaned_text):
@@ -735,6 +933,145 @@ def extract_html_with_paragraph_numbers(html_bytes):
 # Cost tracker
 # ----------------------------------------------------------------------
 
+QUOTA_BREAKER_THRESHOLD = int(os.getenv("QUOTA_BREAKER_THRESHOLD", "10"))
+
+
+def _is_quota_error(error_text):
+    """Return True for OpenAI billing/quota errors that won't clear by retrying."""
+    if not error_text:
+        return False
+    s = str(error_text).lower()
+    return "insufficient_quota" in s or "exceeded your current quota" in s
+
+
+class QuotaCircuitBreaker:
+    """Abort the run only on SUSTAINED insufficient_quota failure.
+
+    OpenAI auto-recharges balance and during the recharge window (~10-30s)
+    new calls 429 with insufficient_quota. With 25 concurrent workers all
+    those misses pile up in <1s, so a naive "10 consecutive failures" trips
+    immediately on a transient.
+
+    The per-worker retry-with-backoff in extract_combined already absorbs
+    short recharge windows. This breaker only catches the case where retries
+    are exhausted AND quota failures continue across a wider time window —
+    i.e. a real billing cap.
+
+    Trip when: at least `threshold` exhausted-retry quota errors AND the most
+    recent success was more than `cold_window_seconds` ago.
+    """
+
+    def __init__(self, threshold=QUOTA_BREAKER_THRESHOLD, cold_window_seconds=120):
+        self._lock = Lock()
+        self.threshold = threshold
+        self.cold_window_seconds = cold_window_seconds
+        self.consecutive = 0
+        self.total = 0
+        self.last_success_ts = time.monotonic()
+        self.aborted = False
+
+    def record_quota_error(self):
+        with self._lock:
+            self.consecutive += 1
+            self.total += 1
+            cold = (time.monotonic() - self.last_success_ts) >= self.cold_window_seconds
+            if not self.aborted and self.consecutive >= self.threshold and cold:
+                self.aborted = True
+                logging.error(
+                    f"QuotaCircuitBreaker tripped: {self.consecutive} exhausted-retry "
+                    f"quota errors with no LLM success for "
+                    f"{int(time.monotonic() - self.last_success_ts)}s. "
+                    f"This looks like a real billing cap. Aborting further LLM calls."
+                )
+            return self.aborted
+
+    def record_success(self):
+        with self._lock:
+            self.consecutive = 0
+            self.last_success_ts = time.monotonic()
+
+    def record_non_quota_error(self):
+        with self._lock:
+            self.consecutive = 0
+
+    def is_aborted(self):
+        with self._lock:
+            return self.aborted
+
+
+# ----------------------------------------------------------------------
+# AustLII data error log
+# ----------------------------------------------------------------------
+#
+# Some AustLII pages exist in the index but the actual viewer page is
+# broken on AustLII's end (e.g. <article class="the-document"><h1>No title</h1>
+# Can't extract contents</article>). These are not scraper bugs; they need
+# manual review and potentially manual upload of the source from elsewhere.
+
+AUSTLII_ERROR_LOG = "austlii_data_errors.json"
+_austlii_error_lock = Lock()
+
+
+def _load_austlii_error_log():
+    if not os.path.exists(AUSTLII_ERROR_LOG):
+        return {}
+    try:
+        with open(AUSTLII_ERROR_LOG, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError) as e:
+        logging.warning(f"Failed to load {AUSTLII_ERROR_LOG}: {e}")
+        return {}
+
+
+def record_austlii_data_error(url, *, case_name, error_type, local_file="",
+                              extracted_chars=0, notes="", live_verified=False):
+    """Append (or update) an AustLII data-error entry for later manual review.
+
+    Thread-safe. Idempotent on (url, error_type): subsequent detections bump
+    `detection_count` and `last_detected_at` but don't duplicate the entry.
+    """
+    with _austlii_error_lock:
+        log = _load_austlii_error_log()
+        now = datetime.datetime.now().isoformat(timespec="seconds")
+        entry = log.get(url, {})
+        if entry and entry.get("error_type") == error_type:
+            entry["detection_count"] = entry.get("detection_count", 1) + 1
+            entry["last_detected_at"] = now
+        else:
+            entry = {
+                "url": url,
+                "case_name": case_name,
+                "error_type": error_type,
+                "first_detected_at": now,
+                "last_detected_at": now,
+                "detection_count": 1,
+                "local_file": local_file,
+                "extracted_chars": extracted_chars,
+                "notes": notes,
+                "live_verified": live_verified,
+                "resolved": False,
+            }
+        # Optional fields can be updated each call
+        if local_file:
+            entry["local_file"] = local_file
+        if extracted_chars:
+            entry["extracted_chars"] = extracted_chars
+        if notes:
+            entry["notes"] = notes
+        if live_verified:
+            entry["live_verified"] = True
+        log[url] = entry
+
+        tmp = AUSTLII_ERROR_LOG + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(log, f, indent=2, ensure_ascii=False, default=str)
+            os.replace(tmp, AUSTLII_ERROR_LOG)
+        except OSError as e:
+            logging.error(f"Failed to write {AUSTLII_ERROR_LOG}: {e}")
+
+
 class CostTracker:
     def __init__(self):
         self._lock = Lock()
@@ -794,6 +1131,17 @@ Personal Injury Commission decision. Produce one structured response with:
     Amounts as nominal numbers (e.g. 150000.00); no $ or commas. If a money
     figure is a regulated costs order rather than compensation/damages, do
     NOT put it in lump_sum_amount.
+
+    WPI fields — TWO fields, different semantics:
+      * impairment_percentage = WPI MADE in this proceeding (the Member made
+        the binding finding). EMPTY for CTP settlement approvals and damages
+        assessments — those merely accept a prior MAS certificate, they
+        don't make the assessment.
+      * impairment_percentage_accepted = WPI USED for the award, regardless
+        of who assessed it. For settlement approvals and damages this is
+        almost always present (and equals the prior MAS figure). Use the
+        COMBINED/TOTAL value the Member relied on; if only component WPIs
+        are stated for different body parts, use the HIGHEST component.
 
 (2) CASE_DESCRIPTION — a comprehensive 500-700 word executive summary in ONE
     PARAGRAPH (no newlines), covering mechanism, injuries, treatment,
@@ -910,21 +1258,41 @@ class LLMExtractor:
             f"{processed}\n"
             "---\n"
         )
-        try:
-            completion = self.client.beta.chat.completions.parse(
-                model=MODEL,
-                messages=[
-                    {"role": "system", "content": _SYSTEM_INSTRUCTION},
-                    {"role": "user", "content": user_content},
-                ],
-                response_format=CombinedSchema,
-                reasoning_effort=REASONING_EFFORT,
-            )
-            return completion.choices[0].message.parsed, completion.usage, None
-        except Exception as e:
-            ctx = f" ({context})" if context else ""
-            logging.error(f"Combined LLM error{ctx}: {e}")
-            return None, None, str(e)
+        # Per-worker retry on insufficient_quota — OpenAI auto-recharges when
+        # the balance drops below a threshold, and during the ~10-30s recharge
+        # window the API returns 429/insufficient_quota even though the
+        # account is in good standing. Treat it like a transient rate limit.
+        # Backoff schedule: 2, 5, 10, 20, 40, 80 seconds (covers ~2.5 minutes
+        # of recharge / brief outage).
+        backoff_schedule = [2, 5, 10, 20, 40, 80]
+        last_error = None
+        for attempt in range(len(backoff_schedule) + 1):
+            try:
+                completion = self.client.beta.chat.completions.parse(
+                    model=MODEL,
+                    messages=[
+                        {"role": "system", "content": _SYSTEM_INSTRUCTION},
+                        {"role": "user", "content": user_content},
+                    ],
+                    response_format=CombinedSchema,
+                    reasoning_effort=REASONING_EFFORT,
+                )
+                return completion.choices[0].message.parsed, completion.usage, None
+            except Exception as e:
+                last_error = e
+                if _is_quota_error(str(e)) and attempt < len(backoff_schedule):
+                    delay = backoff_schedule[attempt]
+                    ctx = f" ({context})" if context else ""
+                    logging.warning(
+                        f"insufficient_quota{ctx} - retry {attempt+1}/{len(backoff_schedule)} in {delay}s "
+                        f"(treating as transient auto-recharge window)"
+                    )
+                    time.sleep(delay)
+                    continue
+                ctx = f" ({context})" if context else ""
+                logging.error(f"Combined LLM error{ctx}: {e}")
+                return None, None, str(e)
+        return None, None, str(last_error)
 
 class DecisionScraper:
     def __init__(self, base_url, output_folder="nsw_decisions", api_key=None):
@@ -936,6 +1304,7 @@ class DecisionScraper:
         self.cache_lock = Lock()
         self.cache = self._load_cache()
         self.cost_tracker = CostTracker()
+        self.quota_breaker = QuotaCircuitBreaker()
         self.rate_limit_lock = Lock()
         self.rate_limit_triggered = False
         self.next_request_time = 0.0
@@ -1052,11 +1421,13 @@ class DecisionScraper:
             self.next_request_time = now + delay
 
     def _make_request_with_retry(self, url, max_retries=5):
+        # Use curl_cffi with Chrome TLS impersonation so we pass Cloudflare's
+        # bot management check (without it AustLII returns 403 on every request).
         for attempt in range(max_retries):
             self._throttle_if_rate_limited()
             try:
-                response = requests.get(url, headers=self.headers, timeout=30)
-                
+                response = cf_requests.get(url, impersonate="chrome", timeout=30)
+
                 if response.status_code == 200:
                     with self.rate_limit_lock:
                         if self.rate_limit_triggered:
@@ -1066,7 +1437,7 @@ class DecisionScraper:
                                 self.rate_limit_success_count = 0
                                 self.next_request_time = 0.0
                     return response
-                
+
                 if response.status_code in [403, 429, 500, 502, 503, 504]:
                     if response.status_code in [403, 429]:
                         with self.rate_limit_lock:
@@ -1078,12 +1449,12 @@ class DecisionScraper:
                 else:
                     logging.error(f"Request failed ({response.status_code}) for {url}. No retry.")
                     return None
-                    
-            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.ChunkedEncodingError) as e:
-                 sleep_time = (2 ** attempt) + random.uniform(0, 1)
-                 logging.warning(f"Connection error ({e}) for {url}. Retrying in {sleep_time:.2f}s...")
-                 time.sleep(sleep_time)
-        
+
+            except Exception as e:
+                sleep_time = (2 ** attempt) + random.uniform(0, 1)
+                logging.warning(f"Connection error ({e}) for {url}. Retrying in {sleep_time:.2f}s...")
+                time.sleep(sleep_time)
+
         logging.error(f"Max retries exceeded for {url}")
         return None
 
@@ -1142,61 +1513,99 @@ class DecisionScraper:
             if self._is_current_schema(cached):
                 return cached
 
-        logging.info(f"Processing: {log_title}")
+        # Predict the local filename from URL+title so we can skip the network
+        # entirely when we already have the file on disk.
+        url_ext = ".pdf" if url.lower().endswith(".pdf") else ".html"
+        expected_safe_title = f"{safe_title_base}{url_ext}"
+        expected_full_path = os.path.join(self.output_folder, expected_safe_title)
 
-        response = self._make_request_with_retry(url)
-        if not response:
-            logging.error(f"Failed to fetch content for {log_title} after retries.")
-            return None
+        is_pdf = (url_ext == ".pdf")
+        raw_text = None
+        safe_title = expected_safe_title
+        full_path = expected_full_path
 
-        content_type = response.headers.get("Content-Type", "").lower()
-        is_pdf = url.lower().endswith(".pdf") or "application/pdf" in content_type
-        is_html = "html" in content_type or not content_type
+        if os.path.exists(expected_full_path):
+            logging.info(f"Using local file for: {log_title}")
+            try:
+                with open(expected_full_path, "rb") as f:
+                    file_bytes = f.read()
+                if is_pdf:
+                    raw_text = self.extractor.extract_text_from_pdf(file_bytes)
+                else:
+                    raw_text = self.extractor.extract_text_from_html(file_bytes)
+            except Exception as e:
+                logging.warning(f"Failed to read local file {expected_full_path}: {e} - refetching")
+                raw_text = None
 
-        if is_pdf:
-            file_extension = ".pdf"
-            raw_text = self.extractor.extract_text_from_pdf(response.content)
-        elif is_html:
-            file_extension = ".html"
-            raw_text = self.extractor.extract_text_from_html(response.content)
-        else:
-            logging.warning(f"Unsupported decision content skipped: {url} ({content_type})")
-            result_data = build_result_record(title, url, status="skipped_unsupported_content")
-            self.update_cache(url, result_data)
-            return result_data
+        if raw_text is None:
+            logging.info(f"Fetching: {log_title}")
+            response = self._make_request_with_retry(url)
+            if not response:
+                logging.error(f"Failed to fetch content for {log_title} after retries.")
+                return None
+
+            content_type = response.headers.get("Content-Type", "").lower()
+            is_pdf = url.lower().endswith(".pdf") or "application/pdf" in content_type
+            is_html = "html" in content_type or not content_type
+
+            if is_pdf:
+                file_extension = ".pdf"
+                raw_text = self.extractor.extract_text_from_pdf(response.content)
+            elif is_html:
+                file_extension = ".html"
+                raw_text = self.extractor.extract_text_from_html(response.content)
+            else:
+                logging.warning(f"Unsupported decision content skipped: {url} ({content_type})")
+                return None
+
+            safe_title = f"{safe_title_base}{file_extension}"
+            full_path = os.path.join(self.output_folder, safe_title)
+            if os.path.exists(full_path):
+                url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
+                root_name, extension = os.path.splitext(safe_title)
+                safe_title = f"{root_name}_{url_hash}{extension}"
+                full_path = os.path.join(self.output_folder, safe_title)
+            with open(full_path, "wb") as f:
+                f.write(response.content)
 
         decision_text = cleanup_text(raw_text)
-        safe_title = f"{safe_title_base}{file_extension}"
-
         if len(decision_text) < 500:
             logging.warning(f"Decision text too short; skipping {log_title}")
-            result_data = build_result_record(title, url, file_saved=safe_title, status="skipped_short_text")
-            self.update_cache(url, result_data)
-            return result_data
+            record_austlii_data_error(
+                url,
+                case_name=title,
+                error_type="html_no_content",
+                local_file=safe_title,
+                extracted_chars=len(decision_text),
+                notes=(
+                    "AustLII viewer rendered an empty <article class='the-document'> "
+                    "with 'No title / Can\\'t extract contents'. Decision listed in index "
+                    "but body is not served; needs manual review."
+                ),
+            )
+            return None
 
-        full_path = os.path.join(self.output_folder, safe_title)
-        if os.path.exists(full_path):
-            url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
-            root_name, extension = os.path.splitext(safe_title)
-            safe_title = f"{root_name}_{url_hash}{extension}"
-            full_path = os.path.join(self.output_folder, safe_title)
-        with open(full_path, 'wb') as f:
-            f.write(response.content)
+        if self.quota_breaker.is_aborted():
+            logging.warning(f"Skipping {log_title}: quota breaker tripped")
+            return None
 
         parsed, usage, llm_error = self.extractor.extract_combined(
             decision_text, context=f"title={log_title}, url={url}",
         )
         token_usage = self.cost_tracker.record(usage) if usage else {}
 
+        # Cache write rule: ONLY on a valid parsed extraction. Every failure
+        # path leaves the cache untouched so the URL is reprocessed naturally
+        # on the next run.
         if llm_error or parsed is None:
-            result_data = build_result_record(
-                title, url, file_saved=safe_title,
-                status="llm_error", llm_error=llm_error or "parse failed",
-            )
-            result_data["_token_usage"] = token_usage
-            self.update_cache(url, result_data)
-            return result_data
+            if _is_quota_error(llm_error):
+                self.quota_breaker.record_quota_error()
+            else:
+                self.quota_breaker.record_non_quota_error()
+                logging.error(f"LLM error for {log_title}: {llm_error or 'parse failed'}")
+            return None
 
+        self.quota_breaker.record_success()
         result_data = self._build_record_from_parsed(
             title=title, url=url, file_saved=safe_title,
             parsed=parsed, decision_text=decision_text,
@@ -1265,7 +1674,10 @@ class DecisionScraper:
             "Injury Date": parsed.date_of_injury,
             "Applicant": parsed.applicant_name,
             "Respondent": parsed.respondent_name,
-            "Claimant Age": parsed.claimant_age,
+            # claimant_age schema allows context like "21 at time of accident";
+            # extract the leading number so the CSV/Excel has clean numerics.
+            # The full contextual narrative remains in _narrative.claimant_profile.
+            "Claimant Age": coerce_leading_number(parsed.claimant_age),
             "Claimant Gender": parsed.claimant_gender,
             "Claimant Occupation": parsed.claimant_occupation,
             "Claimant Weekly Income": parsed.claimant_weekly_income,
@@ -1273,6 +1685,7 @@ class DecisionScraper:
             "Accident/Injury Location": parsed.location_of_accident_or_injury,
             "Claimant Outcome": parsed.claimant_outcome.value,
             "Impairment %": (parsed.impairment_percentage or "").replace("%", "").strip(),
+            "Impairment % (Accepted)": (getattr(parsed, "impairment_percentage_accepted", "") or "").replace("%", "").strip(),
             "Lump Sum": (parsed.lump_sum_amount or "").replace("$", "").replace(",", "").strip(),
             "Weekly Benefit": parsed.weekly_benefit_amount,
             "Non-Economic Loss": parsed.non_economic_loss,
@@ -1283,6 +1696,7 @@ class DecisionScraper:
             "Result": parsed.decision_result,
             "Description": sanitised_case_description,
             "Banded Description": sanitised_banded_description,
+            "Catchwords": extract_catchwords(decision_text),
             "Injury Burden Intensity": parsed.injury_burden_intensity,
             "Psychological Injury Emphasis": parsed.psychological_injury_emphasis,
             "Liability Clarity": parsed.liability_clarity,

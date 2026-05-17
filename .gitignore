@@ -19,6 +19,11 @@ processed_sidecar.json
 extraction_cache.json
 *.cache
 *.bak
+# Operational backup snapshots taken before destructive cache transforms
+processed_cache.json.pre_*
+processed_cache.json.prepurge_*
+processed_cache.json.preretry_*
+processed_cache.json.corrupted
 
 # Local analysis outputs (not source)
 ctp_impairment_lump_sum.xlsx
@@ -34,6 +39,7 @@ test_*_output.txt
 # Logs
 *.log
 scraper.log
+scraper.log.prev_*
 
 # Output files
 detailed_payout_summary.csv
