@@ -1,6 +1,6 @@
 # NSW Court Decision Extractor (AI Enhanced)
 
-A Python tool that scrapes NSW Personal Injury Commission (NSWPIC) decisions from AustLII and uses OpenAI's GPT-4o to extract structured legal information including payout amounts, injury details, dates, and case outcomes.
+A Python tool that scrapes NSW Personal Injury Commission (NSWPIC) decisions from AustLII and uses OpenAI's `gpt-5` to extract structured legal information including payout amounts, injury details, dates, whole-person impairment, and case outcomes.
 
 ![NSW Court Decisions](nsw-court-decisions.png)
 
@@ -8,26 +8,31 @@ A Python tool that scrapes NSW Personal Injury Commission (NSWPIC) decisions fro
 
 - **Automated Scraping**: Fetches court decisions from AustLII NSWPIC index
 - **HTML and PDF Support**: Extracts text from both HTML and PDF decisions
-- **AI-Powered Extraction**: Uses GPT-4o with structured output (Pydantic) to extract detailed case information
-- **Intelligent Caching**: Caches extracted data to avoid re-processing decisions
-- **Parallel Processing**: Processes multiple decisions concurrently (5 threads) for faster execution
+- **AI-Powered Extraction**: Uses `gpt-5` with a single combined structured-output schema (Pydantic) to extract detailed case information
+- **Threshold-Aware WPI Extraction**: Separately tracks the WPI *made* in the proceeding and the WPI *accepted* as the basis of the award, with a high-precision regex + focused-LLM backfill that ignores statutory-threshold framing (see "WPI extraction" below)
+- **Intelligent Caching**: Caches extracted data (keyed by URL) to avoid re-processing decisions
+- **Parallel Processing**: Processes multiple decisions concurrently (default 25 threads) for faster execution
 - **Analysis-Ready Filtering**: Flags rows that are unsuitable for analysis and exports a filtered report
 - **Comprehensive Data Extraction**: Extracts:
   - Applicant and Respondent names
+  - Claimant demographics (age, gender, occupation, weekly income) and employer
+  - Accident/injury location
   - Claimant outcome (For/Against Claimant)
   - Case type (Workers Compensation, CTP, Other)
-  - Impairment percentage
-  - Lump sum and weekly benefit amounts
+  - Impairment percentage (both "made" and "accepted") 
+  - Lump sum, weekly benefit, non-economic loss, future economic loss, statutory benefits
   - Medical costs awarded status
   - Decision nature and result
-  - Case description with injury details
+  - Case description with injury details, plus a PII-banded description
+  - Verbatim catchwords (parsed without the LLM)
+  - Ordinal analysis dimensions (injury burden, psychological emphasis, liability clarity, causation complexity, treatment burden, work impact, pre-existing condition salience, legal/procedural complexity) and regulatory sections
   - Dates (injury and decision)
   - Jurisdiction
 
 ## Prerequisites
 
 1. **Python 3.8+**
-2. **OpenAI API Key**: You must have a paid OpenAI account with access to GPT-4o
+2. **OpenAI API Key**: You must have a paid OpenAI account with access to `gpt-5`
 3. **Internet Connection**: Required to access AustLII and OpenAI API
 
 ## Installation
@@ -64,27 +69,22 @@ The script will:
 
 ### `detailed_payout_summary.csv`
 A comprehensive CSV file containing all extracted data with columns:
-- Case Name
-- URL
-- File Saved
-- Jurisdiction
-- Case Type
-- Decision Date
-- Injury Date
-- Applicant
-- Respondent
+- Case Name, URL, File Saved
+- Jurisdiction, Case Type
+- Decision Date, Injury Date
+- Applicant, Respondent
+- Claimant Age, Claimant Gender, Claimant Occupation, Claimant Weekly Income
+- Employer Name, Accident/Injury Location
 - Claimant Outcome
-- Impairment %
-- Lump Sum
-- Weekly Benefit
+- Impairment % *(WPI made in this proceeding)*
+- Lump Sum, Weekly Benefit, Non-Economic Loss, Future Economic Loss, Statutory Benefits
 - Medical Costs
-- Nature
-- Result
-- Description
-- Status
-- LLM Error
-- Analysis Ready
-- Analysis Exclusion Reason
+- Nature, Result
+- Description, Banded Description, Catchwords
+- Impairment % (Accepted) *(WPI the lump sum is calibrated against — see "WPI extraction")*
+- Ordinal dimensions: Injury Burden Intensity, Psychological Injury Emphasis, Liability Clarity, Causation Complexity, Treatment Burden, Work Impact Severity, Pre-existing Condition Salience, Legal Procedural Complexity
+- Regulatory Sections
+- Status, LLM Error, Analysis Ready, Analysis Exclusion Reason
 
 ### `analysis_ready_payout_summary.csv`
 Filtered CSV export containing only rows that are suitable for downstream analysis. Rows are excluded if processing failed, the LLM extraction failed, or the decision date is missing/invalid.
@@ -115,9 +115,9 @@ Log file containing execution details, errors, and processing status.
 3. **Text Extraction**: Extracts clean text from HTML (focusing on the main content area) and PDF decisions
 
 4. **AI Extraction**: 
-   - Uses GPT-4o with structured output via Pydantic models
-   - Extracts financial highlights using regex patterns
-   - Implements retry logic for inconsistent extractions
+   - Uses `gpt-5` with a single combined structured-output schema via Pydantic models
+   - Extracts financial highlights and WPI using regex patterns
+   - Implements retry logic for inconsistent extractions and quota/rate-limit errors
    - Handles long documents by truncating to key sections
 
 5. **Thread-Safe Caching**: 
@@ -126,22 +126,49 @@ Log file containing execution details, errors, and processing status.
    - Periodically saves cache every 20 completions to prevent data loss
    - Handles corrupted cache files by backing them up and starting fresh
 
-6. **Parallel Processing**: Uses ThreadPoolExecutor (5 workers) to process multiple decisions concurrently
+6. **Parallel Processing**: Uses ThreadPoolExecutor (default 25 workers, configurable via the `EXTRACTION_WORKERS` env var) to process multiple decisions concurrently
 
 7. **CSV Generation**: Writes a full audit CSV and a filtered analysis-ready CSV, both sorted by valid decision date
+
+## WPI extraction
+
+Whole Person Impairment is tracked in two columns:
+
+- **`Impairment %`** — the WPI *made in this proceeding* (the Member's binding finding). Usually empty for CTP settlement approvals/damages assessments that merely accept a prior MAS certificate.
+- **`Impairment % (Accepted)`** — the WPI the lump sum is actually *calibrated against*, regardless of who assessed it. This is the column used for downstream payout-vs-WPI analysis.
+
+`Impairment % (Accepted)` is filled in two stages by `backfill_wpi_accepted.py`:
+
+1. **Regex (free, high-precision):** when exactly one distinct non-zero WPI number appears in the text. Statutory-threshold framing is deliberately ignored — under the MAI Act 2017 the >10% WPI bar gates non-economic loss, so phrases like "does not exceed the threshold of 10% whole person impairment" or "greater than 10% WPI" are *not* findings about the claimant. `find_wpi_candidates`/`_is_threshold_mention` in `nsw_court_scraper.py` drop these.
+2. **Focused LLM (when ambiguous):** a small `gpt-5` call with a hardened prompt that never returns the bare threshold value and prefers the combined/total WPI over components.
 
 ## Additional Scripts
 
 ### `ctp_lump_sum_impairment.py`
-A standalone filtering script that reads `detailed_payout_summary.csv` and produces an Excel file (`ctp_impairment_lump_sum.xlsx`) containing only CTP cases where both Impairment % and Lump Sum are present.
+A standalone filtering script that reads the analysis-ready CSV and produces an Excel workbook (`ctp_impairment_lump_sum.xlsx`) containing only CTP cases where both Impairment % and Lump Sum are present. This workbook is the basis of the payout-vs-WPI analysis.
 
 ```bash
 python ctp_lump_sum_impairment.py
 ```
 
-This script prefers `analysis_ready_payout_summary.csv` when available, and falls back to `detailed_payout_summary.csv` while still filtering out rows that are not analysis-ready.
+This script prefers `analysis_ready_payout_summary.csv` when available, and falls back to `detailed_payout_summary.csv` while still filtering out rows that are not analysis-ready. Requires `pandas` and `openpyxl` (included in `requirements.txt`).
 
-This script requires `pandas` and `openpyxl` (included in `requirements.txt`).
+> **Note:** the backfill/reprocess scripts below rewrite the CSVs but **not** `ctp_impairment_lump_sum.xlsx`. After running any of them, re-run `ctp_lump_sum_impairment.py` to refresh the workbook.
+
+### `backfill_wpi_accepted.py`
+Backfills the `Impairment % (Accepted)` column for CTP cases (regex stage, then focused-LLM stage), seeds it from `Impairment %` where already set, and regenerates both CSVs.
+
+### `reprocess_threshold_wpi.py`
+One-off maintenance: re-extracts `Impairment % (Accepted)` for cases whose value was a statutory-threshold false positive (e.g. a bare `10` read from threshold language) or a rejected/disputed claimant figure. Backs up the cache, re-runs the threshold-aware regex and hardened LLM, and regenerates both CSVs.
+
+### `backfill_catchwords.py`
+Backfills the verbatim `Catchwords` column by parsing the AustLII `CATCHWORDS:` block directly (no LLM).
+
+### `backfill_age_from_dob.py`
+Backfills/cleans `Claimant Age`, deriving it from a stated date of birth and the injury date where possible.
+
+### `reprocess_offline.py`
+Re-runs extraction from already-downloaded local HTML/PDF files without re-scraping AustLII.
 
 ## Configuration
 
@@ -150,7 +177,7 @@ You can modify these settings in `nsw_court_scraper.py`:
 - **Years to process**: Modify the `years` list in `main()` to change the range (currently 2021 to present)
 - **OUTPUT_DIR**: Change the output directory name
 - **CSV_REPORT**: Change the CSV filename
-- **ThreadPoolExecutor max_workers**: Adjust the number of parallel threads (default: 10)
+- **ThreadPoolExecutor max_workers**: Adjust the number of parallel threads (default: 25, or set the `EXTRACTION_WORKERS` env var)
 - **Retry settings**: Adjust `max_retries` in `_make_request_with_retry()` (default: 5)
 - **Cache save frequency**: Change the interval in `main()` where cache is saved (currently every 20 completions)
 - **AUSTLII_INDEX_DELAY**: Seconds to wait between index page requests (default: 2)
@@ -189,27 +216,30 @@ years = [2024]
 - The cache prevents unnecessary API calls and saves costs
 
 ### API Costs
-- Uses GPT-4o (not GPT-4o-mini) for higher accuracy
+- Uses `gpt-5` for higher accuracy; the focused WPI backfill uses a much cheaper small call
 - Costs depend on document length and number of decisions
 - Caching significantly reduces API usage on subsequent runs
 
 ## Data Schema
 
-The extraction uses a structured Pydantic model (`DecisionSchema`) with the following fields:
+The extraction uses a structured Pydantic model with (among others) the following fields:
 
 - `applicant_name`: Name of the Applicant/Claimant
 - `respondent_name`: Name of the Respondent (usually insurer or employer)
+- `claimant_age` / `claimant_gender` / `claimant_occupation` / `claimant_weekly_income`
+- `employer_name`, `accident_injury_location`
 - `claimant_outcome`: Enum (For Claimant / Against Claimant)
 - `case_type`: Enum (Workers Compensation / CTP / Other)
-- `impairment_percentage`: WPI percentage (if assessed)
-- `lump_sum_amount`: Nominal number (no currency symbols)
-- `weekly_benefit_amount`: Nominal number (no currency symbols)
+- `impairment_percentage`: WPI made in this proceeding (if assessed)
+- `impairment_percentage_accepted`: WPI used as the basis of the award
+- `lump_sum_amount`, `weekly_benefit_amount`, `non_economic_loss`, `future_economic_loss`, `statutory_benefits`
 - `medical_costs_awarded`: Enum (Yes / No / N/A)
 - `decision_nature`: Primary category (e.g., Liability Dispute, Permanent Impairment)
 - `decision_result`: Short legal summary
 - `case_description`: Paragraph summarizing injury, claimant, and reasoning
-- `date_of_injury`: YYYY-MM-DD format
-- `date_of_decision`: YYYY-MM-DD format
+- `banded_case_description`: Case description with PII/specifics banded out
+- ordinal analysis dimensions (injury burden, psychological emphasis, liability clarity, causation complexity, treatment burden, work impact, pre-existing salience, legal/procedural complexity)
+- `date_of_injury` / `date_of_decision`: YYYY-MM-DD format
 - `jurisdiction`: Enum (default: NSW)
 
 ## Troubleshooting

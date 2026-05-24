@@ -85,6 +85,21 @@ this proceeding. Capture this in impairment_percentage_accepted.
 If the source states multiple WPI numbers (e.g. 5% cervical spine, 7% lumbar
 spine, combined 12%), prefer the COMBINED/TOTAL value. If only components
 are given without a stated combined value, use the highest component.
+
+CRITICAL — do NOT confuse the statutory threshold with a finding. The 10% WPI
+bar gates non-economic loss under the MAI Act 2017, so phrases like "exceeds
+the 10% whole person impairment threshold", "does not exceed 10% WPI", or
+"the statutory threshold of 10%" describe the LEGISLATIVE BAR, not this
+claimant's impairment. A "10%" that appears ONLY inside such threshold framing
+is NOT the accepted WPI:
+  * "injuries do/does NOT exceed 10%" -> claimant is below the bar; leave
+    impairment_percentage_accepted EMPTY unless a specific assessed figure
+    (e.g. "assessed at 4%") appears elsewhere.
+  * "injuries EXCEED / exceeded the 10% threshold" -> claimant is above the
+    bar but 10 is only the floor; return the actual assessed WPI if the
+    decision states one, otherwise leave it EMPTY. Never return the bare 10.
+Only return 10 when the decision states the claimant was actually ASSESSED at
+10% (e.g. "assessed at 10% WPI", "certified 10% whole person impairment").
 """
 
 

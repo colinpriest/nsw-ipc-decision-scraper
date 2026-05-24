@@ -529,20 +529,66 @@ _WPI_REV_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Statutory-threshold framing. Under the MAI Act 2017 the >10% WPI bar gates
+# non-economic loss, so "the statutory threshold of 10% whole person impairment"
+# appears in countless settlement approvals where the claimant's ACTUAL WPI is 0%.
+# Treating that 10% as a finding is a systematic false positive (e.g. Quick
+# [2024] NSWPIC 93). A WPI token is a threshold mention — not a finding — when
+# the ~60 chars before it contain threshold language. We then drop it from the
+# candidate set so the case bails to focused-LLM extraction instead.
+#
+# A WPI token is threshold framing when any of these hold:
+#   * "threshold"/"exceed(s/ed)" within ~60 chars BEFORE it
+#     ("does not exceed the statutory threshold of 10% WPI");
+#   * "threshold" within ~25 chars AFTER it
+#     ("the 10% whole person impairment threshold");
+#   * a floor phrase (greater/more than, at least, in excess of, not less than)
+#     IMMEDIATELY before it — within ~18 chars ("greater than 10% WPI" -> the
+#     value is a floor, not a finding).
+# The floor phrases are scoped tight on purpose: loose/distant matches wrongly
+# dropped genuine findings ("compression greater than 50% ... 20% WPI",
+# "exceed ... more than 10%. ... a 3% whole person impairment").
+_WPI_THRESHOLD_BEFORE_RE = re.compile(r"(?:threshold|exceed(?:s|ed|ing)?)\b", re.IGNORECASE)
+_WPI_THRESHOLD_AFTER_RE = re.compile(r"^.{0,25}?\bthreshold\b", re.IGNORECASE | re.DOTALL)
+_WPI_FLOOR_ADJ_RE = re.compile(
+    r"(?:greater\s+than|more\s+than|at\s+least|in\s+excess\s+of|no(?:t)?\s+less\s+than)"
+    r"\s*$",
+    re.IGNORECASE,
+)
+_WPI_THRESHOLD_WINDOW = 60
+_WPI_FLOOR_WINDOW = 18
+
+
+def _is_threshold_mention(decision_text, match_start, match_end=None):
+    """True if the WPI number at match_start sits in statutory-threshold framing."""
+    before = decision_text[max(0, match_start - _WPI_THRESHOLD_WINDOW):match_start]
+    if _WPI_THRESHOLD_BEFORE_RE.search(before):
+        return True
+    floor = decision_text[max(0, match_start - _WPI_FLOOR_WINDOW):match_start]
+    if _WPI_FLOOR_ADJ_RE.search(floor):
+        return True
+    if match_end is not None:
+        after = decision_text[match_end:match_end + 30]
+        if _WPI_THRESHOLD_AFTER_RE.search(after):
+            return True
+    return False
+
 
 def find_wpi_candidates(decision_text):
-    """Return the set of distinct WPI numbers (in [0,100]) found in the text."""
+    """Return the set of distinct WPI numbers (in [0,100]) found in the text.
+
+    Numbers appearing in statutory-threshold framing (e.g. "does not exceed the
+    threshold of 10% whole person impairment") are excluded — they describe the
+    legislative bar, not this claimant's impairment.
+    """
     if not decision_text:
         return set()
     values = set()
-    for m in _WPI_FWD_RE.finditer(decision_text):
-        v = float(m.group(1))
-        if 0 <= v <= 100:
-            values.add(v)
-    for m in _WPI_REV_RE.finditer(decision_text):
-        v = float(m.group(1))
-        if 0 <= v <= 100:
-            values.add(v)
+    for rgx in (_WPI_FWD_RE, _WPI_REV_RE):
+        for m in rgx.finditer(decision_text):
+            v = float(m.group(1))
+            if 0 <= v <= 100 and not _is_threshold_mention(decision_text, m.start(), m.end()):
+                values.add(v)
     return values
 
 
