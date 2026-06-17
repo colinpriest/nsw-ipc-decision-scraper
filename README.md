@@ -9,18 +9,20 @@ A Python tool that scrapes NSW Personal Injury Commission (NSWPIC) decisions fro
 - **Automated Scraping**: Fetches court decisions from AustLII NSWPIC index
 - **HTML and PDF Support**: Extracts text from both HTML and PDF decisions
 - **AI-Powered Extraction**: Uses `gpt-5` with a single combined structured-output schema (Pydantic) to extract detailed case information
-- **Threshold-Aware WPI Extraction**: Separately tracks the WPI *made* in the proceeding and the WPI *accepted* as the basis of the award, with a high-precision regex + focused-LLM backfill that ignores statutory-threshold framing (see "WPI extraction" below)
-- **Intelligent Caching**: Caches extracted data (keyed by URL) to avoid re-processing decisions
+- **Threshold-Aware WPI Extraction**: Separately tracks the WPI *made* in the proceeding and the WPI *accepted* as the basis of the award. The high-precision regex + threshold-aware safeguards now run **in the live extraction path** (not just the backfill scripts), seeding/backfilling/cross-checking the WPI on every extraction (see "WPI extraction" below)
+- **Field-loss safeguards (v3)**: A per-field provenance trail, a loss-detection gate, and a focused second pass protect the eight high-value fields (WPI, non-economic loss, weekly income, future economic loss, age, gender, occupation, location) against silent loss — see "Reliability & field-loss safeguards"
+- **Intelligent Caching**: Caches extracted data (keyed by URL) to avoid re-processing decisions. Cache entries are stamped with a `_schema_version`; bumping it forces re-extraction of stale rows
 - **Parallel Processing**: Processes multiple decisions concurrently (default 25 threads) for faster execution
 - **Analysis-Ready Filtering**: Flags rows that are unsuitable for analysis and exports a filtered report
 - **Comprehensive Data Extraction**: Extracts:
   - Applicant and Respondent names
-  - Claimant demographics (age, gender, occupation, weekly income) and employer
-  - Accident/injury location
+  - Claimant demographics: age at injury, **age at decision**, **date of birth** (cross-check), gender (enum), occupation, weekly income and its **basis** (PIAWE/gross/net, conversion used), plus employer
+  - Accident/injury location, with normalised **locality** and **state**
   - Claimant outcome (For/Against Claimant)
   - Case type (Workers Compensation, CTP, Other)
-  - Impairment percentage (both "made" and "accepted") 
-  - Lump sum, weekly benefit, non-economic loss, future economic loss, statutory benefits
+  - Impairment percentage (both "made" and "accepted")
+  - Lump sum, weekly benefit, statutory benefits
+  - Non-economic loss and future economic loss, each as a numeric **amount + status** (Awarded / Nil / Not addressed)
   - Medical costs awarded status
   - Decision nature and result
   - Case description with injury details, plus a PII-banded description
@@ -28,6 +30,7 @@ A Python tool that scrapes NSW Personal Injury Commission (NSWPIC) decisions fro
   - Ordinal analysis dimensions (injury burden, psychological emphasis, liability clarity, causation complexity, treatment burden, work impact, pre-existing condition salience, legal/procedural complexity) and regulatory sections
   - Dates (injury and decision)
   - Jurisdiction
+  - Per-field provenance quotes and a Needs Review flag (see "Reliability & field-loss safeguards")
 
 ## Prerequisites
 
@@ -73,21 +76,25 @@ A comprehensive CSV file containing all extracted data with columns:
 - Jurisdiction, Case Type
 - Decision Date, Injury Date
 - Applicant, Respondent
-- Claimant Age, Claimant Gender, Claimant Occupation, Claimant Weekly Income
-- Employer Name, Accident/Injury Location
+- Claimant Age, Claimant Age At Decision, Claimant Gender, Claimant Occupation
+- Claimant Weekly Income, Claimant Weekly Income Basis
+- Employer Name, Accident/Injury Location, Location Locality, Location State
 - Claimant Outcome
 - Impairment % *(WPI made in this proceeding)*
-- Lump Sum, Weekly Benefit, Non-Economic Loss, Future Economic Loss, Statutory Benefits
+- Lump Sum, Weekly Benefit
+- Non-Economic Loss, Non-Economic Loss Status, Future Economic Loss, Future Economic Loss Status, Statutory Benefits
 - Medical Costs
 - Nature, Result
 - Description, Banded Description, Catchwords
 - Impairment % (Accepted) *(WPI the lump sum is calibrated against — see "WPI extraction")*
 - Ordinal dimensions: Injury Burden Intensity, Psychological Injury Emphasis, Liability Clarity, Causation Complexity, Treatment Burden, Work Impact Severity, Pre-existing Condition Salience, Legal Procedural Complexity
 - Regulatory Sections
-- Status, LLM Error, Analysis Ready, Analysis Exclusion Reason
+- Status, LLM Error, Needs Review, Review Notes, Analysis Ready, Analysis Exclusion Reason
+
+> **Note on damages heads:** `Non-Economic Loss` and `Future Economic Loss` now hold a pure numeric amount (no `$`/commas), with the disposition in the paired `... Status` column — `Awarded` (amount present), `Nil` (claimed but refused/zero, amount `0`), or `Not addressed` (empty). This stops "refused" being confused with "not dealt with".
 
 ### `analysis_ready_payout_summary.csv`
-Filtered CSV export containing only rows that are suitable for downstream analysis. Rows are excluded if processing failed, the LLM extraction failed, or the decision date is missing/invalid.
+Filtered CSV export containing only rows that are suitable for downstream analysis. Rows are excluded if processing failed, the LLM extraction failed, the decision date is missing/invalid, or the row is flagged **Needs Review** (a high-value field the loss gate believes is in the source but was not captured even after the focused second pass). Set `NSW_EXCLUDE_NEEDS_REVIEW=0` to keep Needs Review rows in the analysis-ready set.
 
 ### `nsw_pic_decisions/`
 Directory containing:
@@ -95,7 +102,10 @@ Directory containing:
 - Files are named using sanitized case titles
 
 ### `processed_cache.json`
-JSON cache file storing all extracted data keyed by URL. This prevents re-processing decisions that have already been analyzed.
+JSON cache file storing all extracted data keyed by URL. This prevents re-processing decisions that have already been analyzed. Each row carries a `_schema_version`; when the schema is bumped, rows below the current version are re-extracted.
+
+### `processed_sidecar.json`
+Companion JSON (keyed by URL) holding the long/nested fields that don't fit a CSV cell: narrative sub-fields, LLM-marked verbatim slices, key paragraphs, event history, regulatory sections, token usage, banding validation, the **per-field provenance quotes** (`provenance`), and the **field-review record** (`field_review`: the loss-gate issues, the focused second-pass outcome, DOB and age-at-decision). Consumed by `ctp_lump_sum_impairment.py`.
 
 ### `ctp_impairment_lump_sum.xlsx`
 Filtered Excel export containing only CTP cases that have both an Impairment % and a Lump Sum value. Generated by running `ctp_lump_sum_impairment.py` (see below).
@@ -137,10 +147,33 @@ Whole Person Impairment is tracked in two columns:
 - **`Impairment %`** — the WPI *made in this proceeding* (the Member's binding finding). Usually empty for CTP settlement approvals/damages assessments that merely accept a prior MAS certificate.
 - **`Impairment % (Accepted)`** — the WPI the lump sum is actually *calibrated against*, regardless of who assessed it. This is the column used for downstream payout-vs-WPI analysis.
 
-`Impairment % (Accepted)` is filled in two stages by `backfill_wpi_accepted.py`:
+As of v3 the WPI safeguards run **in the live extraction path** (`reconcile_wpi` in `nsw_court_scraper.py`), not only in the backfill scripts. On every extraction the pipeline:
 
-1. **Regex (free, high-precision):** when exactly one distinct non-zero WPI number appears in the text. Statutory-threshold framing is deliberately ignored — under the MAI Act 2017 the >10% WPI bar gates non-economic loss, so phrases like "does not exceed the threshold of 10% whole person impairment" or "greater than 10% WPI" are *not* findings about the claimant. `find_wpi_candidates`/`_is_threshold_mention` in `nsw_court_scraper.py` drop these.
-2. **Focused LLM (when ambiguous):** a small `gpt-5` call with a hardened prompt that never returns the bare threshold value and prefers the combined/total WPI over components.
+1. **Cleans** both WPI values — drops implausible values (outside 0–100%) and a lone `0` (almost always statutory-threshold / minor-injury framing, not a finding).
+2. **Seeds** `Impairment % (Accepted)` from `Impairment %` when the lenient value is blank (a WPI made here is, by definition, relied on).
+3. **Regex-backfills** the accepted value when the LLM left it blank and exactly one distinct non-zero WPI appears in the text. Statutory-threshold framing is deliberately ignored — under the MAI Act 2017 the >10% WPI bar gates non-economic loss, so phrases like "does not exceed the threshold of 10% whole person impairment" or "greater than 10% WPI" are *not* findings about the claimant. `find_wpi_candidates`/`_is_threshold_mention` drop these.
+4. **Cross-checks** a populated accepted value against the lone-token regex value and flags any mismatch for review (may be a legitimate combined-vs-component case).
+
+The standalone `backfill_wpi_accepted.py` / `reprocess_threshold_wpi.py` scripts remain for re-running these safeguards over an existing cache without a full re-extraction.
+
+## Reliability & field-loss safeguards
+
+Version 3 hardens the extraction of the eight high-value fields — **WPI %, Non-Economic Loss, Claimant Weekly Income, Future Economic Loss, Claimant Age, Gender, Occupation, Location** — so they are captured reliably and not silently dropped:
+
+- **Per-field provenance (A2):** the model returns a verbatim source quote for each of the eight fields. A non-empty quote next to an empty value is treated as a contradiction. Stored in the sidecar under `provenance`.
+- **Field-loss gate (A1):** after the first pass, `detect_field_losses` flags any field that is empty but whose value is clearly present in the source (a strong textual signal, e.g. a `% WPI`/`PIAWE`/`aged NN` token near a dollar amount, or a provenance quote the model itself supplied). It deliberately skips NEL/FEL marked `Nil` (a real determination).
+- **Focused second pass (A6):** when a high-value field looks lost, `extract_focused` re-asks **only** for the suspect fields, at a higher reasoning effort (`NSW_FOCUSED_REASONING_EFFORT`, default `medium`). Recovered values are merged without overwriting anything the first pass already captured.
+- **Needs Review (C4):** if a high-severity loss survives the second pass, the row is flagged `Needs Review = Yes` and held out of the analysis-ready set, with a human-readable `Review Notes` summary.
+- **Coercion & plausibility (B2/B3):** money fields are coerced to clean numbers; weekly income is range-checked (`NSW_INCOME_WEEKLY_MIN`/`MAX`, default 50–15000) to catch unit errors (an annual figure not converted to weekly).
+- **Age cross-check (B4):** the DOB-derived age is compared against the stated age and a mismatch is flagged.
+- **Truncation anchoring (A3):** for long decisions, `_narrative_truncate` keeps the quantum/claimant sections (non-economic loss, PIAWE, WPI, DOB, occupation, …) and anchors on both the first and last occurrence of each keyword, so the section where these fields live survives. The single-pass budget is raised to 200k chars (`NSW_SINGLE_PASS_LIMIT_CHARS`).
+
+### `test_extraction_fields.py`
+Golden-fixture regression tests for the deterministic helpers above (coercion, WPI reconciliation incl. the threshold trap, the loss gate, the focused-pass merge, age/DOB cross-check, truncation anchoring). Run them whenever the prompt or `SCHEMA_VERSION` changes:
+
+```bash
+python test_extraction_fields.py   # or: pytest test_extraction_fields.py
+```
 
 ## Additional Scripts
 
@@ -182,6 +215,14 @@ You can modify these settings in `nsw_court_scraper.py`:
 - **Cache save frequency**: Change the interval in `main()` where cache is saved (currently every 20 completions)
 - **AUSTLII_INDEX_DELAY**: Seconds to wait between index page requests (default: 2)
 - **AUSTLII_RATE_LIMIT_DELAY**: Seconds to throttle decision requests after rate limiting is detected (default: 5)
+
+### v3 field-reliability env vars
+
+- **NSW_SINGLE_PASS_LIMIT_CHARS**: Max chars sent to the model in one pass before keyword-anchored truncation (default: 200000)
+- **NSW_FOCUSED_SECOND_PASS**: Set `0` to disable the focused second pass (default: on)
+- **NSW_FOCUSED_REASONING_EFFORT**: Reasoning effort for the focused second pass (default: `medium`)
+- **NSW_EXCLUDE_NEEDS_REVIEW**: Set `0` to keep `Needs Review` rows in the analysis-ready set (default: exclude)
+- **NSW_INCOME_WEEKLY_MIN** / **NSW_INCOME_WEEKLY_MAX**: Plausible weekly-income range for the unit-error check (defaults: 50 / 15000)
 
 ## Important Notes
 
@@ -226,14 +267,19 @@ The extraction uses a structured Pydantic model with (among others) the followin
 
 - `applicant_name`: Name of the Applicant/Claimant
 - `respondent_name`: Name of the Respondent (usually insurer or employer)
-- `claimant_age` / `claimant_gender` / `claimant_occupation` / `claimant_weekly_income`
-- `employer_name`, `accident_injury_location`
+- `claimant_age` (at injury) / `claimant_age_at_decision` / `claimant_date_of_birth`
+- `claimant_gender`: Enum (Male / Female / Other / Not stated)
+- `claimant_occupation`
+- `claimant_weekly_income` / `claimant_weekly_income_basis`
+- `employer_name`, `location_of_accident_or_injury`, `location_locality`, `location_state`
 - `claimant_outcome`: Enum (For Claimant / Against Claimant)
 - `case_type`: Enum (Workers Compensation / CTP / Other)
 - `impairment_percentage`: WPI made in this proceeding (if assessed)
 - `impairment_percentage_accepted`: WPI used as the basis of the award
-- `lump_sum_amount`, `weekly_benefit_amount`, `non_economic_loss`, `future_economic_loss`, `statutory_benefits`
+- `lump_sum_amount`, `weekly_benefit_amount`, `statutory_benefits`
+- `non_economic_loss` / `non_economic_loss_status`, `future_economic_loss` / `future_economic_loss_status`: amount + Enum (Awarded / Nil / Not addressed)
 - `medical_costs_awarded`: Enum (Yes / No / N/A)
+- `provenance`: per-field verbatim source quotes for the eight high-value fields
 - `decision_nature`: Primary category (e.g., Liability Dispute, Permanent Impairment)
 - `decision_result`: Short legal summary
 - `case_description`: Paragraph summarizing injury, claimant, and reasoning

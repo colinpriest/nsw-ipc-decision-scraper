@@ -37,7 +37,12 @@ ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # Bump SCHEMA_VERSION when the cached extraction shape changes. Rows with a
 # mismatched _schema_version are re-processed.
-SCHEMA_VERSION = 2
+#
+# v3: gender enum; age split into at-injury / at-decision + DOB cross-check;
+#     weekly-income basis + numeric coercion; NEL/FEL status enums; location
+#     locality/state; per-field provenance; live WPI reconciliation; field-loss
+#     gate with focused second pass; Needs Review.
+SCHEMA_VERSION = 3
 
 RESULT_FIELDS = [
     # Identity
@@ -46,12 +51,17 @@ RESULT_FIELDS = [
     "Jurisdiction", "Case Type", "Decision Date", "Injury Date",
     "Applicant", "Respondent",
     # Claimant info
-    "Claimant Age", "Claimant Gender", "Claimant Occupation",
-    "Claimant Weekly Income", "Employer Name", "Accident/Injury Location",
+    "Claimant Age", "Claimant Age At Decision",
+    "Claimant Gender", "Claimant Occupation",
+    "Claimant Weekly Income", "Claimant Weekly Income Basis",
+    "Employer Name", "Accident/Injury Location",
+    "Location Locality", "Location State",
     # Outcome
     "Claimant Outcome",
     "Impairment %", "Lump Sum", "Weekly Benefit",
-    "Non-Economic Loss", "Future Economic Loss", "Statutory Benefits",
+    "Non-Economic Loss", "Non-Economic Loss Status",
+    "Future Economic Loss", "Future Economic Loss Status",
+    "Statutory Benefits",
     "Medical Costs",
     "Nature", "Result", "Description", "Banded Description", "Catchwords",
     "Impairment % (Accepted)",
@@ -64,8 +74,22 @@ RESULT_FIELDS = [
     "Regulatory Sections",
     # Status
     "Status", "LLM Error",
+    "Needs Review", "Review Notes",
     "Analysis Ready", "Analysis Exclusion Reason",
 ]
+
+# The eight high-value target fields the extraction must capture reliably.
+# Used by the field-loss gate, the focused second pass, and coverage metrics.
+KEY_TARGET_FIELDS = (
+    "Impairment % (Accepted)",
+    "Non-Economic Loss",
+    "Claimant Weekly Income",
+    "Future Economic Loss",
+    "Claimant Age",
+    "Claimant Gender",
+    "Claimant Occupation",
+    "Accident/Injury Location",
+)
 
 # Keys stored on cached rows but excluded from the flat CSV output.
 SIDECAR_KEYS = (
@@ -76,12 +100,23 @@ SIDECAR_KEYS = (
     "_schema_version",
     "_token_usage",          # last extraction's token usage
     "_banding_validation",   # banded_case_description validation result
+    "_provenance",           # per-field verbatim source quotes (A2)
+    "_field_review",         # field-loss gate issues + second-pass record (A1/A6)
 )
 
 MODEL = "gpt-5"
 REASONING_EFFORT = "low"
+# Reasoning effort for the focused second pass (A6) — bumped above the main
+# pass because it only fires on the handful of fields the first pass missed.
+FOCUSED_REASONING_EFFORT = os.getenv("NSW_FOCUSED_REASONING_EFFORT", "medium")
+# Toggle the focused second pass (A6). Default on; set to 0 to disable (e.g. to
+# bound cost on a large backfill).
+FOCUSED_SECOND_PASS_ENABLED = os.getenv("NSW_FOCUSED_SECOND_PASS", "1") not in ("0", "false", "False", "")
 DEFAULT_WORKERS = 25
-SINGLE_PASS_LIMIT_CHARS = 100_000
+# Single-pass char budget. gpt-5's context is far larger than this; the cap
+# exists only to bound cost on rare very long decisions. Raised from 100k and
+# made env-configurable so most decisions are sent whole (no truncation loss).
+SINGLE_PASS_LIMIT_CHARS = int(os.getenv("NSW_SINGLE_PASS_LIMIT_CHARS", "200000"))
 
 # Pricing (USD per 1M tokens) — override via env if needed
 PRICE_INPUT_PER_M = float(os.getenv("GPT5_PRICE_INPUT_PER_M", "1.25"))
@@ -93,6 +128,13 @@ def has_valid_iso_date(value):
     if not isinstance(value, str):
         return False
     return bool(ISO_DATE_PATTERN.fullmatch(value.strip()))
+
+
+# Rows flagged Needs Review (a high-value field the gate believes is present in
+# the source but the extraction did not capture, even after the focused second
+# pass) are held out of the analysis-ready set so probable losses are triaged
+# rather than silently consumed. Toggle with NSW_EXCLUDE_NEEDS_REVIEW=0.
+EXCLUDE_NEEDS_REVIEW = os.getenv("NSW_EXCLUDE_NEEDS_REVIEW", "1") not in ("0", "false", "False", "")
 
 
 def get_analysis_exclusion_reasons(row):
@@ -107,6 +149,9 @@ def get_analysis_exclusion_reasons(row):
 
     if not has_valid_iso_date(row.get("Decision Date", "")):
         reasons.append("missing_decision_date")
+
+    if EXCLUDE_NEEDS_REVIEW and str(row.get("Needs Review", "") or "").strip() == "Yes":
+        reasons.append("needs_review")
 
     return reasons
 
@@ -127,6 +172,7 @@ def build_result_record(title, url, file_saved="", status="", llm_error="", **ov
         "File Saved": file_saved,
         "Status": status,
         "LLM Error": llm_error,
+        "Needs Review": "No",
     })
     # Sidecar defaults
     row["_schema_version"] = SCHEMA_VERSION
@@ -135,6 +181,8 @@ def build_result_record(title, url, file_saved="", status="", llm_error="", **ov
     row["_key_paragraphs"] = []
     row["_event_history"] = []
     row["_token_usage"] = {}
+    row["_provenance"] = {}
+    row["_field_review"] = {}
     row.update(overrides)
     return annotate_analysis_fields(row)
 
@@ -162,6 +210,39 @@ class MedicalCostsEnum(str, Enum):
     YES = "Yes"
     NO = "No"
     NA = "N/A"
+
+class GenderEnum(str, Enum):
+    MALE = "Male"
+    FEMALE = "Female"
+    OTHER = "Other"
+    NOT_STATED = "Not stated"
+
+class QuantumStatusEnum(str, Enum):
+    """Disposition of a damages head, kept separate from its dollar amount so
+    'explicitly denied' (Nil) is never conflated with 'not dealt with in this
+    decision' (Not addressed)."""
+    AWARDED = "Awarded"
+    NIL = "Nil"
+    NOT_ADDRESSED = "Not addressed"
+
+
+class QuantumProvenance(BaseModel):
+    """Per-field verbatim source snippets supporting the eight high-value
+    target fields. Used to (a) audit the extraction, (b) detect silent losses
+    (a non-empty quote alongside an empty value is a contradiction), and
+    (c) make the income normalisation checkable. Each quote is a VERBATIM
+    substring copied from the source (<=200 chars) that ESTABLISHES the value;
+    empty string when the field is genuinely 'Not stated' / Nil / Not addressed
+    (do NOT quote text that merely proves the field is absent)."""
+    wpi_quote: str = Field(description="Verbatim source text stating the WPI %, e.g. '...assessed at 14% whole person impairment...'. Empty if no WPI is stated anywhere.")
+    non_economic_loss_quote: str = Field(description="Verbatim source text stating non-economic loss / general damages / pain and suffering. Empty if not addressed.")
+    weekly_income_quote: str = Field(description="Verbatim source text stating the income figure used (e.g. PIAWE, weekly wage, salary). Empty if no income figure appears.")
+    future_economic_loss_quote: str = Field(description="Verbatim source text stating future economic loss / buffer / loss of future earning capacity. Empty if not addressed.")
+    age_quote: str = Field(description="Verbatim source text stating the claimant's age or date of birth. Empty if neither appears.")
+    gender_quote: str = Field(description="Verbatim source text indicating the claimant's gender (explicit statement or clear gendered reference). Empty if not determinable.")
+    occupation_quote: str = Field(description="Verbatim source text stating the claimant's occupation. Empty if not stated.")
+    location_quote: str = Field(description="Verbatim source text stating where the injury/accident occurred. Empty if not stated.")
+
 
 class SliceLocator(BaseModel):
     present: bool = Field(description="True if this section is identifiable in the source.")
@@ -214,14 +295,33 @@ class CombinedSchema(BaseModel):
     claimant_outcome: ClaimantOutcomeEnum
     case_type: CaseCategoryEnum
     claimant_age: str = Field(description=(
-        "Claimant's age. Prefer age at time of injury/accident. "
-        "Examples: '47', '21 at time of accident'. "
-        "If only year-of-birth is stated (e.g. 'born in 1995' or 'date of birth: "
-        "12 March 1995'), DERIVE the age = injury_year - birth_year and emit "
-        "the number (e.g. '28'). 'Not stated' only if neither an age nor a "
-        "year-of-birth can be found anywhere in the decision."
+        "Claimant's age AT THE TIME OF INJURY/ACCIDENT, as a number. "
+        "Examples: '47', '21'. DERIVE it whenever possible:\n"
+        "  - From year of birth: age = injury_year - birth_year.\n"
+        "  - From a stated CURRENT age (age at the decision/assessment): "
+        "age_at_injury = current_age - (decision_year - injury_year). E.g. 'the "
+        "claimant is now 31' in a 2021 decision for a 2018 injury => '28'.\n"
+        "'Not stated' ONLY if there is no age, no year-of-birth, and no current "
+        "age anywhere in the decision."
     ))
-    claimant_gender: str = Field(description="Claimant's gender if stated (Male / Female / Other / Not stated).")
+    claimant_age_at_decision: str = Field(description=(
+        "Claimant's age AT THE TIME OF THE DECISION/ASSESSMENT, as a number. Use "
+        "a stated current age directly; otherwise derive it (from date-of-birth "
+        "and the decision date, or as age_at_injury + (decision_year - "
+        "injury_year)). 'Not stated' if it cannot be determined. May equal "
+        "claimant_age when injury and decision fall in the same year."
+    ))
+    claimant_date_of_birth: str = Field(description=(
+        "Claimant's date of birth as YYYY-MM-DD if a full date is stated; or the "
+        "4-digit year alone (e.g. '1995') if only the year is given. 'Not stated' "
+        "if no birth date or birth year appears. Used to cross-check the ages."
+    ))
+    claimant_gender: GenderEnum = Field(description=(
+        "Claimant's gender. Choose Male/Female/Other from an explicit statement "
+        "OR from unambiguous gendered references in the decision (consistent use "
+        "of he/his or she/her for the claimant, 'Mr'/'Ms'/'Mrs'). Use 'Not "
+        "stated' only when gender is genuinely indeterminable."
+    ))
     claimant_occupation: str = Field(description="Claimant's occupation at time of injury (e.g. 'bus driver', 'registered nurse', 'senior laboratory technician'). 'Not stated' if absent.")
     claimant_weekly_income: str = Field(description=(
         "A SINGLE NOMINAL NUMBER representing the claimant's total weekly "
@@ -239,8 +339,18 @@ class CombinedSchema(BaseModel):
         "Use 'Not stated' (literally) only if NO weekly-or-convertible income "
         "figure of any kind appears in the decision."
     ))
+    claimant_weekly_income_basis: str = Field(description=(
+        "Short label describing WHAT claimant_weekly_income represents and how it "
+        "was derived, so the figure is auditable. State: the source measure "
+        "(PIAWE / pre-injury weekly / post-injury weekly / current earnings), "
+        "gross vs net, and the original period if you converted it (e.g. 'PIAWE, "
+        "gross, weekly as stated'; 'gross annual salary 89500 / 52'; 'hourly 32.50 "
+        "x 38h'). 'Not stated' if no income figure was found."
+    ))
     employer_name: str = Field(description="Employer's legal name (workers compensation only). 'Not applicable' for CTP / non-employment cases. 'Not stated' if WC case but employer not named.")
     location_of_accident_or_injury: str = Field(description="Where the injury occurred — for CTP: road/intersection/town; for WC: workplace address/town. 'Not stated' if absent.")
+    location_locality: str = Field(description="The town/suburb/locality of the accident or injury, normalised (e.g. 'Parramatta', 'Wagga Wagga'). 'Not stated' if no locality is identifiable.")
+    location_state: str = Field(description="The state/territory of the accident or injury as an abbreviation (NSW/VIC/QLD/WA/SA/TAS/ACT/NT). Default 'NSW' for NSWPIC matters unless the decision clearly places the injury in another state. 'Not stated' only if genuinely indeterminable.")
     impairment_percentage: str = Field(description=(
         "Whole Person Impairment percentage when a binding assessment is made "
         "IN THIS PROCEEDING (e.g. '15'). LEAVE EMPTY if the decision merely "
@@ -266,8 +376,10 @@ class CombinedSchema(BaseModel):
     ))
     lump_sum_amount: str = Field(description="Total lump sum awarded for COMPENSATION (s 66 WPI or settlement principal). Regulated costs orders do NOT belong here. Empty if none.")
     weekly_benefit_amount: str = Field(description="Weekly benefit amount as a NOMINAL NUMBER (e.g. '540.50'). If multiple periods, use the LATEST. NET amount if deductions quantified.")
-    non_economic_loss: str = Field(description="Damages for non-economic loss (pain and suffering) as a nominal number. 'Not stated' if not addressed; 'Nil' if explicitly denied.")
-    future_economic_loss: str = Field(description="Damages for future economic loss (incl. loss of future earnings/super) as a nominal number. 'Not stated' if not addressed; 'Nil' if explicitly denied.")
+    non_economic_loss: str = Field(description="Damages for non-economic loss (pain and suffering) as a nominal number (digits only, no $ or commas). Leave EMPTY when not addressed or denied — the disposition goes in non_economic_loss_status.")
+    non_economic_loss_status: QuantumStatusEnum = Field(description="Disposition of non-economic loss / general damages: 'Awarded' if a positive amount was allowed (put it in non_economic_loss); 'Nil' if a claim was made but explicitly refused/assessed at zero; 'Not addressed' if this head was not dealt with in the decision.")
+    future_economic_loss: str = Field(description="Damages for future economic loss (incl. loss of future earnings/super and buffers) as a nominal number (digits only, no $ or commas). Leave EMPTY when not addressed or denied — the disposition goes in future_economic_loss_status.")
+    future_economic_loss_status: QuantumStatusEnum = Field(description="Disposition of future economic loss: 'Awarded' if a positive amount/buffer was allowed (put it in future_economic_loss); 'Nil' if claimed but explicitly refused/assessed at zero; 'Not addressed' if not dealt with.")
     statutory_benefits: str = Field(description="Statutory benefits status (e.g. 'Weekly $522.84 from 28 Sept 2023 ongoing'; 'Terminated after 26 weeks'; 'Not addressed'). Short descriptive string.")
     medical_costs_awarded: MedicalCostsEnum = Field(description="Were medical costs explicitly awarded/ordered? 'Yes' if ordered. 'No' if explicitly denied. 'N/A' if not discussed or silent.")
     decision_nature: str = Field(description="PRIMARY category of the dispute. Simplify to one of: 'Liability Dispute', 'Permanent Impairment', 'Medical Dispute', 'Death Benefit', 'Damages', 'Settlement Approval', 'Statutory Benefits Dispute', 'Procedural'.")
@@ -413,6 +525,15 @@ class CombinedSchema(BaseModel):
         "framing of the legal issue, and the conclusion. Return ONLY paragraph "
         "numbers and short rationales. The actual paragraph text will be cut from "
         "the source — do NOT return it."
+    ))
+
+    # ---- Per-field provenance for the eight high-value target fields ----
+    provenance: QuantumProvenance = Field(description=(
+        "For each of the eight high-value fields, the VERBATIM source snippet "
+        "supporting your value (or empty string if the field is genuinely 'Not "
+        "stated'). Copy text exactly from the source. A non-empty quote with an "
+        "empty/Not-stated value is treated as a mistake, so only leave a quote "
+        "empty when the fact truly does not appear in the decision."
     ))
 
 # ----------------------------------------------------------------------
@@ -953,6 +1074,410 @@ def validate_banding(banded_text, record=None):
     }
 
 
+# ----------------------------------------------------------------------
+# Field coercion, WPI reconciliation, age cross-check, loss detection
+# ----------------------------------------------------------------------
+#
+# These run on every extraction (in _build_record_from_parsed) so the eight
+# high-value fields are coerced to clean values, the WPI safeguards that used
+# to live only in the backfill scripts are applied in the LIVE path, and any
+# field that looks lost (empty value but a clear signal in the source) is
+# flagged for a focused second pass and, if still missing, for human review.
+
+# Plausible weekly-income band in AUD. Outside this range almost always means a
+# unit error (an annual or monthly figure not converted to weekly).
+INCOME_WEEKLY_MIN = float(os.getenv("NSW_INCOME_WEEKLY_MIN", "50"))
+INCOME_WEEKLY_MAX = float(os.getenv("NSW_INCOME_WEEKLY_MAX", "15000"))
+
+_VALUE_SENTINELS = {
+    "", "not stated", "not applicable", "n/a", "unknown",
+    "none", "nil", "not addressed",
+}
+
+
+def _value_present(v):
+    """True if `v` is a real captured value (not empty / not a sentinel)."""
+    return str(v or "").strip().lower() not in _VALUE_SENTINELS
+
+
+def coerce_money(val):
+    """Coerce an LLM money string to a clean numeric string (digits + one dot),
+    or "" for sentinels / unparseable input. Thin wrapper over
+    coerce_leading_number (which already strips $ and commas and rejects the
+    'Nil'/'Not addressed' sentinels)."""
+    return coerce_leading_number(val)
+
+
+def _clean_wpi_value(raw):
+    """Return a plausible WPI value as a tidy string, or "" to drop it.
+
+    Drops sentinels, values outside (0, 100], and a lone 0 — '0% WPI' is almost
+    always statutory-threshold/minor-injury framing rather than a finding (see
+    extract_wpi_confident)."""
+    p = _parse_pct(raw)
+    if p is None or p <= 0 or p > 100:
+        return ""
+    return str(int(p)) if p == int(p) else str(p)
+
+
+def reconcile_wpi(strict_raw, accepted_raw, decision_text):
+    """Reconcile the two WPI columns in the live extraction path.
+
+    - Cleans both values (plausibility + lone-zero suppression).
+    - Seeds the lenient 'accepted' value from the strict 'made-here' value when
+      the LLM left it blank (a value made here is, by definition, relied on).
+    - Backfills 'accepted' from the high-precision single-token regex when the
+      LLM left it blank and the source contains exactly one non-zero WPI.
+    - Cross-checks a populated 'accepted' against that regex value and flags a
+      mismatch for review (could be a legitimate combined-vs-component case).
+
+    Returns (strict, accepted, issues).
+    """
+    issues = []
+    strict = _clean_wpi_value(strict_raw)
+    accepted = _clean_wpi_value(accepted_raw)
+
+    if not accepted and strict:
+        accepted = strict
+
+    conf = extract_wpi_confident(decision_text)
+    if not accepted:
+        if conf is not None:
+            accepted = str(int(conf)) if conf == int(conf) else str(conf)
+            issues.append({
+                "field": "Impairment % (Accepted)", "type": "wpi_regex_backfill",
+                "severity": "low",
+                "detail": f"LLM left WPI empty; recovered {accepted} from a lone source token",
+            })
+    else:
+        ap = _parse_pct(accepted)
+        if conf is not None and ap is not None and abs(conf - ap) > 0.01:
+            issues.append({
+                "field": "Impairment % (Accepted)", "type": "wpi_mismatch",
+                "severity": "medium",
+                "detail": f"LLM WPI={accepted} but the only source WPI token is {conf}",
+            })
+    return strict, accepted, issues
+
+
+_YEAR_RE = re.compile(r"\b(19\d{2}|20\d{2})\b")
+
+
+def _year_of(date_str):
+    if not date_str:
+        return None
+    m = _YEAR_RE.search(str(date_str))
+    return int(m.group(1)) if m else None
+
+
+def derive_age_from_dob(dob, ref_date):
+    """Age in whole years from a DOB (YYYY-MM-DD or a bare year) relative to a
+    reference date (YYYY-MM-DD or a bare year). None if undeterminable or
+    implausible. Year-difference precision is adequate here — we only use it as
+    a cross-check, not as the primary value."""
+    by, ry = _year_of(dob), _year_of(ref_date)
+    if by is None or ry is None:
+        return None
+    age = ry - by
+    return age if 0 <= age <= 120 else None
+
+
+def check_age_consistency(stated_age, dob, ref_date, *, label="age"):
+    """Return a review issue dict if a stated age and a DOB-derived age both
+    exist and disagree by more than a year; otherwise None."""
+    stated = _parse_age(stated_age)
+    derived = derive_age_from_dob(dob, ref_date)
+    if stated is None or derived is None:
+        return None
+    if abs(stated - derived) > 1:
+        return {
+            "field": "Claimant Age", "type": f"{label}_dob_mismatch", "severity": "medium",
+            "detail": f"stated {label}={stated} but DOB-derived={derived}",
+        }
+    return None
+
+
+def reconcile_ages(age_injury, age_decision, injury_date, decision_date):
+    """Fill age-at-injury and age-at-decision from EACH OTHER using the elapsed
+    years between injury and decision. No date of birth needed:
+
+        age_at_injury  = age_at_decision - (decision_year - injury_year)
+        age_at_decision = age_at_injury  + (decision_year - injury_year)
+
+    A decision that says only 'the claimant is now 31' (age at decision) in 2021
+    for a 2018 injury still fixes age-at-injury at 31 - 3 = 28. Approximate to
+    +/-1 year (birthday timing within the year), well inside the tolerance used
+    elsewhere. Only fills a BLANK value; never overwrites one already present.
+    Returns (age_injury, age_decision) as strings."""
+    ai = coerce_leading_number(age_injury)
+    ad = coerce_leading_number(age_decision)
+    iy, dy = _year_of(injury_date), _year_of(decision_date)
+    if iy is not None and dy is not None and dy >= iy:
+        gap = dy - iy
+        if not ai and ad:
+            v = int(float(ad)) - gap
+            if 0 < v < 120:
+                ai = str(v)
+        elif not ad and ai:
+            v = int(float(ai)) + gap
+            if 0 < v < 120:
+                ad = str(v)
+    return ai, ad
+
+
+# Source-signal detectors used by the loss gate. A money head (NEL/FEL/income)
+# only counts when a dollar amount sits near the head phrase, which keeps mere
+# recitations of submissions from registering as findings.
+_SIG_NEL_RE = re.compile(r"non[-\s]?economic loss|general damages|pain and suffering", re.IGNORECASE)
+_SIG_FEL_RE = re.compile(
+    r"future economic loss|future loss of earning|loss of (?:future )?earning capacity|\bbuffer\b",
+    re.IGNORECASE,
+)
+_SIG_INCOME_RE = re.compile(
+    r"\bPIAWE\b|pre[-\s]?injury average weekly|per week|weekly (?:wage|earnings|income)|gross weekly",
+    re.IGNORECASE,
+)
+_SIG_AGE_RE = re.compile(
+    r"\baged?\s+\d{1,3}\b|\b\d{1,3}[-\s]year[-\s]old\b|date of birth|\bborn\s+(?:on|in)\b",
+    re.IGNORECASE,
+)
+_SIG_OCC_RE = re.compile(
+    r"employed as\b|worked as\b|by occupation\b|by trade\b|occupation (?:was|is|of)",
+    re.IGNORECASE,
+)
+_SIG_MONEY_RE = re.compile(r"\$\s?\d")
+
+
+def _head_with_money(text, head_re, window=160):
+    """True if `head_re` matches `text` with a dollar amount within `window`
+    characters of the match."""
+    for m in head_re.finditer(text):
+        s = max(0, m.start() - window)
+        e = min(len(text), m.end() + window)
+        if _SIG_MONEY_RE.search(text[s:e]):
+            return True
+    return False
+
+
+# Maps each high-value column to (provenance-quote key, focused-field key) so
+# the loss gate and the focused second pass agree on field identity.
+FIELD_LOSS_SPEC = {
+    "Impairment % (Accepted)": ("wpi_quote", "wpi_percent", "high"),
+    "Non-Economic Loss":       ("non_economic_loss_quote", "non_economic_loss", "high"),
+    "Claimant Weekly Income":  ("weekly_income_quote", "claimant_weekly_income", "high"),
+    "Future Economic Loss":    ("future_economic_loss_quote", "future_economic_loss", "high"),
+    "Claimant Age":            ("age_quote", "claimant_age", "high"),
+    "Claimant Gender":         ("gender_quote", "claimant_gender", "medium"),
+    "Claimant Occupation":     ("occupation_quote", "claimant_occupation", "medium"),
+    "Accident/Injury Location": ("location_quote", "location", "medium"),
+}
+
+
+def _quote_present(prov, key):
+    val = str((prov or {}).get(key, "") or "").strip()
+    return len(val) >= 4 and val.lower() not in ("not stated", "n/a", "none")
+
+
+# Idea 3: a provenance quote that actually PROVES the field is absent (a claim
+# not made / not pressed, the claimant unemployed, etc.) must not count as a
+# captured-but-dropped value. These phrases mark such quotes.
+_ABSENCE_RE = re.compile(
+    r"\b(?:not\s+claim(?:ed)?|did\s+not\s+claim|no\s+claim(?:\s+(?:for|was|is))?|"
+    r"confined\s+to|not\s+(?:being\s+)?pressed|no\s+longer\s+pressed|not\s+sought|"
+    r"un\-?employed|not\s+employed|not\s+working|no\s+evidence\s+of|"
+    r"not\s+in\s+receipt|abandoned|withdr(?:ew|awn)|not\s+entitled|"
+    r"declined\s+to\s+claim|no\s+award|not\s+awarded|did\s+not\s+(?:press|pursue|seek))\b",
+    re.IGNORECASE,
+)
+
+
+def _quote_indicates_absence(quote):
+    return bool(quote) and bool(_ABSENCE_RE.search(str(quote)))
+
+
+def _quote_signal(prov, key):
+    """A provenance quote that genuinely supports a value: present, and not a
+    quote that proves the field's absence."""
+    if not _quote_present(prov, key):
+        return False
+    return not _quote_indicates_absence((prov or {}).get(key, ""))
+
+
+def _quote_has_clean_wpi(quote):
+    """True if the WPI quote contains exactly one clean, non-zero, non-threshold
+    WPI value — i.e. a value that could actually be recovered. 'greater than
+    10%' / threshold framing yields no candidate (find_wpi_candidates drops it),
+    so those don't qualify."""
+    cand = {v for v in find_wpi_candidates(str(quote or "")) if v > 0}
+    return len(cand) == 1
+
+
+def detect_field_losses(record, decision_text, provenance=None):
+    """Flag high-value fields that are empty in `record` but whose value looks
+    present in the source (a strong textual signal, or a provenance quote the
+    model itself supplied). Returns a list of issue dicts. This is the A1 gate;
+    its output drives the focused second pass and the Needs Review flag."""
+    prov = provenance or {}
+    text = decision_text or ""
+    issues = []
+
+    def flag(field, severity, detail):
+        issues.append({"field": field, "type": "possible_loss",
+                       "severity": severity, "detail": detail})
+
+    # WPI — DETECTION stays broad (any WPI token in the text, or a quote) so the
+    # cheap second pass can recover values the first pass missed (e.g. a combined
+    # total when only components were captured). ESCALATION to Needs Review is
+    # the precise part: confirmed_high_losses requires the quote to carry a clean
+    # non-threshold value, so threshold/remittal cases recover-or-ignore without
+    # inflating review (Idea 2 applies there, not here).
+    if not _value_present(record.get("Impairment % (Accepted)")):
+        if find_wpi_candidates(text) or _quote_signal(prov, "wpi_quote"):
+            flag("Impairment % (Accepted)", "high", "WPI token/quote in source but field empty")
+
+    # Non-economic loss (Idea 1) — trust the model's disposition: a loss only
+    # when AWARDED but the amount is missing (a true internal contradiction).
+    # Nil / Not addressed are deliberate determinations, not losses.
+    if (str(record.get("Non-Economic Loss Status", "")).strip() == "Awarded"
+            and not _value_present(record.get("Non-Economic Loss"))):
+        flag("Non-Economic Loss", "high", "NEL marked Awarded but amount missing")
+
+    # Future economic loss (Idea 1)
+    if (str(record.get("Future Economic Loss Status", "")).strip() == "Awarded"
+            and not _value_present(record.get("Future Economic Loss"))):
+        flag("Future Economic Loss", "high", "FEL marked Awarded but amount missing")
+
+    # Weekly income
+    if not _value_present(record.get("Claimant Weekly Income")):
+        if _head_with_money(text, _SIG_INCOME_RE) or _quote_signal(prov, "weekly_income_quote"):
+            flag("Claimant Weekly Income", "high", "Income figure in source but field empty")
+
+    # Age — don't flag when age-at-decision IS captured: the claimant's age is
+    # recorded (in the other column) and age-at-injury simply may not be
+    # derivable (no injury year to subtract). reconcile_ages already fills
+    # age-at-injury whenever both years are known, so a still-empty Claimant Age
+    # next to a present Claimant Age At Decision is a derivation limit, not a
+    # lost value.
+    if (not _value_present(record.get("Claimant Age"))
+            and not _value_present(record.get("Claimant Age At Decision"))):
+        if _SIG_AGE_RE.search(text) or _quote_signal(prov, "age_quote"):
+            flag("Claimant Age", "high", "Age/DOB in source but field empty")
+
+    # Gender — provenance-driven only (pronoun scanning is too noisy).
+    if not _value_present(record.get("Claimant Gender")) and _quote_signal(prov, "gender_quote"):
+        flag("Claimant Gender", "medium", "Gender quote present but field Not stated")
+
+    # Occupation
+    if not _value_present(record.get("Claimant Occupation")):
+        if _SIG_OCC_RE.search(text) or _quote_signal(prov, "occupation_quote"):
+            flag("Claimant Occupation", "medium", "Occupation cue in source but field empty")
+
+    # Location — provenance-driven only.
+    if not _value_present(record.get("Accident/Injury Location")) and _quote_signal(prov, "location_quote"):
+        flag("Accident/Injury Location", "medium", "Location quote present but field empty")
+
+    return issues
+
+
+def merge_focused_into_record(result, focused, target_cols):
+    """Overlay non-empty values from a FocusedFields result onto `result`, but
+    only for the flagged `target_cols` and only where the column is still empty
+    (never override a value the first pass already captured). Returns the list
+    of columns actually recovered."""
+    recovered = []
+
+    def set_if(col, value):
+        if _value_present(value) and not _value_present(result.get(col)):
+            result[col] = value
+            recovered.append(col)
+            return True
+        return False
+
+    def _status_value(attr):
+        s = getattr(focused, attr, None)
+        return s.value if s is not None else ""
+
+    for col in target_cols:
+        if col == "Impairment % (Accepted)":
+            set_if(col, _clean_wpi_value(getattr(focused, "wpi_percent", "")))
+        elif col == "Non-Economic Loss":
+            amt = coerce_money(getattr(focused, "non_economic_loss", ""))
+            status = _status_value("non_economic_loss_status")
+            if status == "Nil" and not amt:
+                amt = "0"
+            if status and status != "Not addressed":
+                result["Non-Economic Loss Status"] = status
+            set_if(col, amt)
+        elif col == "Future Economic Loss":
+            amt = coerce_money(getattr(focused, "future_economic_loss", ""))
+            status = _status_value("future_economic_loss_status")
+            if status == "Nil" and not amt:
+                amt = "0"
+            if status and status != "Not addressed":
+                result["Future Economic Loss Status"] = status
+            set_if(col, amt)
+        elif col == "Claimant Weekly Income":
+            if set_if(col, coerce_money(getattr(focused, "claimant_weekly_income", ""))):
+                basis = getattr(focused, "claimant_weekly_income_basis", "")
+                if _value_present(basis) and not _value_present(result.get("Claimant Weekly Income Basis")):
+                    result["Claimant Weekly Income Basis"] = basis
+        elif col == "Claimant Age":
+            set_if(col, coerce_leading_number(getattr(focused, "claimant_age", "")))
+        elif col == "Claimant Gender":
+            g = getattr(focused, "claimant_gender", None)
+            set_if(col, g.value if g is not None else "")
+        elif col == "Claimant Occupation":
+            set_if(col, getattr(focused, "claimant_occupation", ""))
+        elif col == "Accident/Injury Location":
+            set_if(col, getattr(focused, "location", ""))
+    return recovered
+
+
+def worth_second_pass(losses, provenance):
+    """Whether the focused second pass is worth its cost: fire for any
+    high-severity loss (the five numeric/core fields) or a medium loss the
+    model itself backed with a provenance quote. Skips weak medium-only,
+    regex-driven hits (e.g. a generic 'employed' mention) to avoid spending an
+    LLM call where recovery is unlikely."""
+    for iss in losses:
+        if iss["severity"] == "high":
+            return True
+        spec = FIELD_LOSS_SPEC.get(iss["field"])
+        if spec and _quote_signal(provenance, spec[0]):
+            return True
+    return False
+
+
+def confirmed_high_losses(remaining_losses, provenance):
+    """High-severity losses the model itself corroborated with a provenance
+    quote — i.e. it quoted the fact but still left the field empty, a genuine
+    self-contradiction. ONLY these escalate a row to Needs Review.
+
+    A bare regex/text signal without a corroborating quote is NOT escalated:
+    sample validation showed those are mostly false positives — WPI tokens in
+    remittal or statutory-threshold context, or income/FEL amounts recited in
+    submissions rather than awarded. Such cases still trigger the (cheap)
+    focused second pass via worth_second_pass; they're recorded in the field
+    review for triage but do not exclude the row from analysis."""
+    out = []
+    for iss in remaining_losses:
+        if iss.get("severity") != "high":
+            continue
+        field = iss.get("field")
+        spec = FIELD_LOSS_SPEC.get(field)
+        if not spec:
+            continue
+        if field == "Impairment % (Accepted)":
+            # Idea 2: WPI escalates only when the quote holds a single clean,
+            # non-threshold value (threshold 'greater than 10%' / a claimed
+            # figure on a remitted matter do not).
+            if _quote_has_clean_wpi((provenance or {}).get("wpi_quote", "")):
+                out.append(iss)
+        elif _quote_signal(provenance, spec[0]):
+            out.append(iss)
+    return out
+
+
 def extract_html_with_paragraph_numbers(html_bytes):
     """
     NSWPIC HTML uses <ol><li value="N"> for numbered paragraphs; BS4's
@@ -1178,6 +1703,21 @@ Personal Injury Commission decision. Produce one structured response with:
     figure is a regulated costs order rather than compensation/damages, do
     NOT put it in lump_sum_amount.
 
+    HIGH-VALUE TARGET FIELDS — these eight are the most important outputs and
+    are frequently buried deep in the decision. Actively SEARCH the whole
+    document (including the quantum/assessment and orders sections, which are
+    usually near the end) before deciding any of them is absent. Use the
+    'Not stated' / empty / 'Not addressed' sentinel ONLY after a genuine
+    search, never as a shortcut:
+      - WPI % (impairment_percentage / impairment_percentage_accepted)
+      - non_economic_loss (+ non_economic_loss_status)
+      - claimant_weekly_income (+ claimant_weekly_income_basis)
+      - future_economic_loss (+ future_economic_loss_status)
+      - claimant_age (at injury), claimant_age_at_decision, claimant_date_of_birth
+      - claimant_gender
+      - claimant_occupation
+      - location_of_accident_or_injury (+ location_locality, location_state)
+
     WPI fields — TWO fields, different semantics:
       * impairment_percentage = WPI MADE in this proceeding (the Member made
         the binding finding). EMPTY for CTP settlement approvals and damages
@@ -1188,6 +1728,34 @@ Personal Injury Commission decision. Produce one structured response with:
         almost always present (and equals the prior MAS figure). Use the
         COMBINED/TOTAL value the Member relied on; if only component WPIs
         are stated for different body parts, use the HIGHEST component.
+      Do NOT emit 0 — a '0% WPI' mention is almost always statutory threshold
+      / minor-injury framing, not a finding about this claimant.
+
+    DAMAGES HEADS use a status + amount pair so 'refused' is never confused
+    with 'not dealt with':
+      * non_economic_loss / future_economic_loss = the dollar amount (number
+        only) when AWARDED; leave EMPTY otherwise.
+      * *_status = Awarded (amount allowed) / Nil (claimed but refused or
+        assessed at zero) / Not addressed (head not dealt with in this case).
+
+    INCOME: emit a single normalised weekly number AND record in
+    claimant_weekly_income_basis what it represents (PIAWE/pre/post, gross/net)
+    and any conversion you performed (annual/52, monthly, hourly x hours).
+
+    AGE: claimant_age = age AT INJURY; claimant_age_at_decision = age at the
+    decision; claimant_date_of_birth = DOB (full date or year) for cross-check.
+    DERIVE age by arithmetic when not stated directly: from year of birth, or
+    from a stated current age minus the injury->decision gap (a claimant 'now
+    31' in a 2021 decision for a 2018 injury was 28 at injury). Do not return
+    'Not stated' for age when a current age and the injury year are both known.
+
+(1b) PROVENANCE — in the `provenance` object, for EACH of the eight target
+    fields, copy the VERBATIM source snippet that ESTABLISHES your value (<=200
+    chars). The quote must support a CAPTURED value, not describe its absence:
+    if the field is 'Not stated' / Nil / Not addressed (e.g. the claim was not
+    pressed, the claimant was unemployed, the matter was remitted for later
+    assessment), leave that quote EMPTY. A non-empty quote beside an empty value
+    is treated as an error and will be re-checked, so keep them consistent.
 
 (2) CASE_DESCRIPTION — a comprehensive 500-700 word executive summary in ONE
     PARAGRAPH (no newlines), covering mechanism, injuries, treatment,
@@ -1235,33 +1803,105 @@ Personal Injury Commission decision. Produce one structured response with:
 
 def _narrative_truncate(text):
     """If the source overflows the single-pass char limit, keep the start +
-    a chunk near each likely-key section."""
+    a chunk near each likely-key section.
+
+    The keyword list deliberately includes the QUANTUM / CLAIMANT-PROFILE
+    section terms (non-economic loss, future economic loss, PIAWE, weekly,
+    impairment/WPI, damages, buffer, date of birth, aged, occupation). These
+    are where the eight high-value target fields live, and in long decisions
+    they sit near the END — so they must survive truncation. We also anchor on
+    BOTH the first and last occurrence of each keyword because the operative
+    quantum assessment is usually the later mention."""
     if len(text) <= SINGLE_PASS_LIMIT_CHARS:
         return text
     keywords = (
+        # Structure
         "Background", "Facts", "History",
         "Particulars", "Mechanism", "Medical evidence",
         "Pre-existing", "Treatment", "Diagnosis", "Surgery",
         "Expert evidence", "Submissions", "Reasoning", "Findings",
         "Reasons", "Discussion", "Issues", "Orders", "Conclusion", "Decision",
+        # Quantum / damages heads (where the 8 target fields live)
+        "non-economic loss", "non economic loss", "general damages",
+        "pain and suffering", "future economic loss", "loss of earning",
+        "earning capacity", "buffer", "quantum", "damages assessment",
+        "whole person impairment", "impairment", "WPI",
+        # Claimant profile / income
+        "PIAWE", "weekly", "per week", "pre-injury", "salary", "wage",
+        "date of birth", "born", "aged", "occupation", "employed",
     )
     lowered = text.lower()
     segments = [text[:30000]]
     seen = {text[:30000]}
-    for kw in keywords:
-        idx = lowered.find(kw.lower())
-        if idx == -1:
-            continue
+
+    def add_window(idx):
         start = max(0, idx - 3000)
         end = min(len(text), idx + 10000)
         seg = text[start:end].strip()
         if seg and seg not in seen:
             seen.add(seg)
             segments.append(seg)
+
+    for kw in keywords:
+        kwl = kw.lower()
+        first = lowered.find(kwl)
+        if first == -1:
+            continue
+        add_window(first)
+        last = lowered.rfind(kwl)
+        if last != -1 and abs(last - first) > 8000:
+            add_window(last)
+
     combined = "\n\n...[SECTION BREAK]...\n\n".join(segments)
     if len(combined) > SINGLE_PASS_LIMIT_CHARS:
         combined = combined[:SINGLE_PASS_LIMIT_CHARS]
     return combined
+
+
+# ----------------------------------------------------------------------
+# Focused second pass (A6)
+# ----------------------------------------------------------------------
+#
+# Fires only when the loss gate (detect_field_losses) believes a high-value
+# field is present in the source but the first pass left it empty. It re-asks
+# ONLY for the suspect fields, optionally at a higher reasoning effort. Cheap,
+# because it runs on the handful of decisions that need it and returns a small
+# schema.
+
+class FocusedFields(BaseModel):
+    wpi_percent: str = Field(description="Whole Person Impairment % relied on for the award (combined/total, or highest component). Number only. EMPTY if no WPI is stated; never emit 0 for threshold/minor-injury framing.")
+    non_economic_loss: str = Field(description="Non-economic loss / general damages amount as a number (no $/commas). EMPTY if not awarded.")
+    non_economic_loss_status: QuantumStatusEnum = Field(description="Awarded / Nil (refused) / Not addressed.")
+    claimant_weekly_income: str = Field(description="Total weekly employment income as a single number (convert annual/monthly/hourly to weekly; prefer pre-injury PIAWE, gross). EMPTY if none.")
+    claimant_weekly_income_basis: str = Field(description="What the income figure represents and any conversion (e.g. 'PIAWE gross weekly'; 'annual 89500 / 52'). 'Not stated' if none.")
+    future_economic_loss: str = Field(description="Future economic loss / buffer amount as a number (no $/commas). EMPTY if not awarded.")
+    future_economic_loss_status: QuantumStatusEnum = Field(description="Awarded / Nil (refused) / Not addressed.")
+    claimant_age: str = Field(description="Claimant's age at injury as a number (derive from year of birth if needed). 'Not stated' if neither age nor birth year appears.")
+    claimant_gender: GenderEnum = Field(description="Male / Female / Other / Not stated (from explicit statement or unambiguous gendered references).")
+    claimant_occupation: str = Field(description="Claimant's occupation at time of injury. 'Not stated' if absent.")
+    location: str = Field(description="Where the injury/accident occurred. 'Not stated' if absent.")
+
+
+_FOCUSED_SYSTEM_INSTRUCTION = """\
+You are re-examining a NSW Personal Injury Commission decision because a first
+extraction pass may have MISSED one or more specific high-value fields. Read
+the WHOLE source carefully — especially the quantum/assessment and orders
+sections, which are usually near the end — and extract the requested fields.
+
+Semantics:
+  - Money amounts are plain numbers (no $ or commas).
+  - WPI: the percentage relied on for the award; combined/total, or the highest
+    component if only components are stated. Never emit 0 for statutory
+    threshold / minor-injury language.
+  - Income: a single normalised weekly number; convert annual/monthly/hourly;
+    prefer pre-injury PIAWE and gross.
+  - Damages heads use status (Awarded/Nil/Not addressed) + amount.
+  - Age: prefer age at injury; derive from year of birth if needed.
+
+Only use a 'Not stated' / empty sentinel after a genuine search confirms the
+fact is absent. Fill every field in the schema, but the caller will only use
+the fields it flagged as missing.
+"""
 
 
 class LLMExtractor:
@@ -1288,6 +1928,47 @@ class LLMExtractor:
                 pages.append(page_text.strip())
         return "\n\n".join(pages).strip()
 
+    def _parse_with_retry(self, system_instruction, user_content, response_format,
+                          context=None, reasoning_effort=REASONING_EFFORT):
+        """Shared structured-parse call with insufficient_quota backoff.
+
+        Returns (parsed, usage, error). OpenAI auto-recharges when the balance
+        drops below a threshold, and during the ~10-30s recharge window the API
+        returns 429/insufficient_quota even though the account is in good
+        standing — treat it like a transient rate limit. Backoff schedule:
+        2, 5, 10, 20, 40, 80 seconds (covers ~2.5 minutes of recharge / brief
+        outage).
+        """
+        backoff_schedule = [2, 5, 10, 20, 40, 80]
+        last_error = None
+        for attempt in range(len(backoff_schedule) + 1):
+            try:
+                completion = self.client.beta.chat.completions.parse(
+                    model=MODEL,
+                    messages=[
+                        {"role": "system", "content": system_instruction},
+                        {"role": "user", "content": user_content},
+                    ],
+                    response_format=response_format,
+                    reasoning_effort=reasoning_effort,
+                )
+                return completion.choices[0].message.parsed, completion.usage, None
+            except Exception as e:
+                last_error = e
+                if _is_quota_error(str(e)) and attempt < len(backoff_schedule):
+                    delay = backoff_schedule[attempt]
+                    ctx = f" ({context})" if context else ""
+                    logging.warning(
+                        f"insufficient_quota{ctx} - retry {attempt+1}/{len(backoff_schedule)} in {delay}s "
+                        f"(treating as transient auto-recharge window)"
+                    )
+                    time.sleep(delay)
+                    continue
+                ctx = f" ({context})" if context else ""
+                logging.error(f"LLM parse error{ctx}: {e}")
+                return None, None, str(e)
+        return None, None, str(last_error)
+
     def extract_combined(self, source_text, context=None):
         """
         Single combined gpt-5 call. Returns (parsed, usage, error). The caller
@@ -1304,41 +1985,39 @@ class LLMExtractor:
             f"{processed}\n"
             "---\n"
         )
-        # Per-worker retry on insufficient_quota — OpenAI auto-recharges when
-        # the balance drops below a threshold, and during the ~10-30s recharge
-        # window the API returns 429/insufficient_quota even though the
-        # account is in good standing. Treat it like a transient rate limit.
-        # Backoff schedule: 2, 5, 10, 20, 40, 80 seconds (covers ~2.5 minutes
-        # of recharge / brief outage).
-        backoff_schedule = [2, 5, 10, 20, 40, 80]
-        last_error = None
-        for attempt in range(len(backoff_schedule) + 1):
-            try:
-                completion = self.client.beta.chat.completions.parse(
-                    model=MODEL,
-                    messages=[
-                        {"role": "system", "content": _SYSTEM_INSTRUCTION},
-                        {"role": "user", "content": user_content},
-                    ],
-                    response_format=CombinedSchema,
-                    reasoning_effort=REASONING_EFFORT,
-                )
-                return completion.choices[0].message.parsed, completion.usage, None
-            except Exception as e:
-                last_error = e
-                if _is_quota_error(str(e)) and attempt < len(backoff_schedule):
-                    delay = backoff_schedule[attempt]
-                    ctx = f" ({context})" if context else ""
-                    logging.warning(
-                        f"insufficient_quota{ctx} - retry {attempt+1}/{len(backoff_schedule)} in {delay}s "
-                        f"(treating as transient auto-recharge window)"
-                    )
-                    time.sleep(delay)
-                    continue
-                ctx = f" ({context})" if context else ""
-                logging.error(f"Combined LLM error{ctx}: {e}")
-                return None, None, str(e)
-        return None, None, str(last_error)
+        return self._parse_with_retry(
+            _SYSTEM_INSTRUCTION, user_content, CombinedSchema,
+            context=context, reasoning_effort=REASONING_EFFORT,
+        )
+
+    def extract_focused(self, source_text, fields_needed, context=None):
+        """Focused second pass for fields the first pass appears to have missed.
+
+        `fields_needed` is an iterable of focused-field keys (the second element
+        of FIELD_LOSS_SPEC values, e.g. 'wpi_percent', 'claimant_age'). Returns
+        (parsed_FocusedFields, usage, error).
+        """
+        if not source_text:
+            return None, None, "empty source"
+        needed = sorted(set(fields_needed or []))
+        if not needed:
+            return None, None, "no fields requested"
+
+        processed = _narrative_truncate(source_text)
+        user_content = (
+            "A first extraction pass may have MISSED these fields:\n"
+            f"  {', '.join(needed)}\n\n"
+            "Re-read the decision below and extract them (fill the whole schema; "
+            "only the listed fields will be used). Search the entire document, "
+            "including the quantum/assessment and orders sections.\n\n"
+            "---\n"
+            f"{processed}\n"
+            "---\n"
+        )
+        return self._parse_with_retry(
+            _FOCUSED_SYSTEM_INSTRUCTION, user_content, FocusedFields,
+            context=context, reasoning_effort=FOCUSED_REASONING_EFFORT,
+        )
 
 class DecisionScraper:
     def __init__(self, base_url, output_folder="nsw_decisions", api_key=None):
@@ -1431,6 +2110,8 @@ class DecisionScraper:
                     "Case Name": row.get("Case Name", ""),
                     "File Saved": row.get("File Saved", ""),
                     "Status": row.get("Status", ""),
+                    "Needs Review": row.get("Needs Review", ""),
+                    "Review Notes": row.get("Review Notes", ""),
                     "_schema_version": row.get("_schema_version"),
                     "narrative": row.get("_narrative", {}),
                     "slices": row.get("_slices", {}),
@@ -1439,6 +2120,8 @@ class DecisionScraper:
                     "regulatory_sections": (row.get("Regulatory Sections") or "").split(" | "),
                     "token_usage": row.get("_token_usage", {}),
                     "banding_validation": row.get("_banding_validation", {}),
+                    "provenance": row.get("_provenance", {}),
+                    "field_review": row.get("_field_review", {}),
                 }
                 sidecar[url] = entry
 
@@ -1713,6 +2396,67 @@ class DecisionScraper:
             "legal_issues_and_reasoning": parsed.legal_issues_and_reasoning,
         }
 
+        # ---- Provenance (A2): per-field verbatim quotes from the model ----
+        prov = getattr(parsed, "provenance", None)
+        provenance = {
+            "wpi_quote": getattr(prov, "wpi_quote", "") or "",
+            "non_economic_loss_quote": getattr(prov, "non_economic_loss_quote", "") or "",
+            "weekly_income_quote": getattr(prov, "weekly_income_quote", "") or "",
+            "future_economic_loss_quote": getattr(prov, "future_economic_loss_quote", "") or "",
+            "age_quote": getattr(prov, "age_quote", "") or "",
+            "gender_quote": getattr(prov, "gender_quote", "") or "",
+            "occupation_quote": getattr(prov, "occupation_quote", "") or "",
+            "location_quote": getattr(prov, "location_quote", "") or "",
+        }
+
+        review_issues = []
+
+        # ---- WPI reconciliation (B1): live regex/threshold safeguards ----
+        wpi_strict, wpi_accepted, wpi_issues = reconcile_wpi(
+            parsed.impairment_percentage,
+            getattr(parsed, "impairment_percentage_accepted", ""),
+            decision_text,
+        )
+        review_issues.extend(wpi_issues)
+
+        # ---- Damages heads (B2): status + coerced numeric amount ----
+        nel_status = parsed.non_economic_loss_status.value
+        nel_amount = coerce_money(parsed.non_economic_loss)
+        if nel_status == "Nil" and not nel_amount:
+            nel_amount = "0"
+        fel_status = parsed.future_economic_loss_status.value
+        fel_amount = coerce_money(parsed.future_economic_loss)
+        if fel_status == "Nil" and not fel_amount:
+            fel_amount = "0"
+
+        # ---- Weekly income (B3): coercion + range plausibility ----
+        income_amount = coerce_money(parsed.claimant_weekly_income)
+        if income_amount:
+            try:
+                iv = float(income_amount)
+                if iv < INCOME_WEEKLY_MIN or iv > INCOME_WEEKLY_MAX:
+                    review_issues.append({
+                        "field": "Claimant Weekly Income", "type": "income_out_of_range",
+                        "severity": "medium",
+                        "detail": f"weekly income {income_amount} outside "
+                                  f"[{INCOME_WEEKLY_MIN:g}, {INCOME_WEEKLY_MAX:g}] - possible unit error",
+                    })
+            except ValueError:
+                pass
+
+        # ---- Age (B4): at-injury / at-decision + DOB cross-check ----
+        age_injury = coerce_leading_number(parsed.claimant_age)
+        age_decision = coerce_leading_number(getattr(parsed, "claimant_age_at_decision", ""))
+        # Derive one age from the other via the injury->decision gap (no DOB
+        # needed): e.g. 'now 31' at a 2021 decision for a 2018 injury => 28 at
+        # injury. Fills blanks only.
+        age_injury, age_decision = reconcile_ages(
+            age_injury, age_decision, parsed.date_of_injury, parsed.date_of_decision)
+        dob = (getattr(parsed, "claimant_date_of_birth", "") or "").strip()
+        age_issue = check_age_consistency(age_injury, dob, parsed.date_of_injury, label="age")
+        if age_issue:
+            review_issues.append(age_issue)
+
         flat_overrides = {
             "Jurisdiction": parsed.jurisdiction.value,
             "Case Type": parsed.case_type.value,
@@ -1720,22 +2464,28 @@ class DecisionScraper:
             "Injury Date": parsed.date_of_injury,
             "Applicant": parsed.applicant_name,
             "Respondent": parsed.respondent_name,
-            # claimant_age schema allows context like "21 at time of accident";
+            # claimant_age may carry context like "21 at time of accident";
             # extract the leading number so the CSV/Excel has clean numerics.
             # The full contextual narrative remains in _narrative.claimant_profile.
-            "Claimant Age": coerce_leading_number(parsed.claimant_age),
-            "Claimant Gender": parsed.claimant_gender,
+            "Claimant Age": age_injury,
+            "Claimant Age At Decision": age_decision,
+            "Claimant Gender": parsed.claimant_gender.value,
             "Claimant Occupation": parsed.claimant_occupation,
-            "Claimant Weekly Income": parsed.claimant_weekly_income,
+            "Claimant Weekly Income": income_amount,
+            "Claimant Weekly Income Basis": getattr(parsed, "claimant_weekly_income_basis", ""),
             "Employer Name": parsed.employer_name,
             "Accident/Injury Location": parsed.location_of_accident_or_injury,
+            "Location Locality": getattr(parsed, "location_locality", ""),
+            "Location State": getattr(parsed, "location_state", ""),
             "Claimant Outcome": parsed.claimant_outcome.value,
-            "Impairment %": (parsed.impairment_percentage or "").replace("%", "").strip(),
-            "Impairment % (Accepted)": (getattr(parsed, "impairment_percentage_accepted", "") or "").replace("%", "").strip(),
+            "Impairment %": wpi_strict,
+            "Impairment % (Accepted)": wpi_accepted,
             "Lump Sum": (parsed.lump_sum_amount or "").replace("$", "").replace(",", "").strip(),
             "Weekly Benefit": parsed.weekly_benefit_amount,
-            "Non-Economic Loss": parsed.non_economic_loss,
-            "Future Economic Loss": parsed.future_economic_loss,
+            "Non-Economic Loss": nel_amount,
+            "Non-Economic Loss Status": nel_status,
+            "Future Economic Loss": fel_amount,
+            "Future Economic Loss Status": fel_status,
             "Statutory Benefits": parsed.statutory_benefits,
             "Medical Costs": parsed.medical_costs_awarded.value,
             "Nature": parsed.decision_nature,
@@ -1758,13 +2508,63 @@ class DecisionScraper:
             title, url, file_saved=file_saved, status="ok",
             **flat_overrides,
         )
+
+        token_usage = dict(token_usage or {})
+
+        # ---- Field-loss gate (A1) + focused second pass (A6) ----
+        initial_losses = detect_field_losses(result, decision_text, provenance)
+        second_pass = {"requested": [], "recovered": [], "error": ""}
+        if initial_losses and FOCUSED_SECOND_PASS_ENABLED and self.extractor \
+                and not self.quota_breaker.is_aborted() \
+                and worth_second_pass(initial_losses, provenance):
+            target_cols = sorted({iss["field"] for iss in initial_losses})
+            fields_needed = [FIELD_LOSS_SPEC[c][1] for c in target_cols if c in FIELD_LOSS_SPEC]
+            second_pass["requested"] = target_cols
+            fparsed, fusage, ferr = self.extractor.extract_focused(
+                decision_text, fields_needed,
+                context=f"focused second pass for {url}",
+            )
+            if fusage is not None:
+                token_usage["focused_pass"] = self.cost_tracker.record(fusage)
+            if ferr or fparsed is None:
+                second_pass["error"] = ferr or "focused parse failed"
+            else:
+                recovered = merge_focused_into_record(result, fparsed, target_cols)
+                second_pass["recovered"] = recovered
+                if recovered:
+                    logging.info(
+                        f"Focused second pass recovered {recovered} for {url}"
+                    )
+
+        remaining_losses = detect_field_losses(result, decision_text, provenance)
+
+        # ---- Needs Review (C4): only provenance-confirmed losses exclude ----
+        confirmed = confirmed_high_losses(remaining_losses, provenance)
+        if confirmed:
+            result["Needs Review"] = "Yes"
+        note_bits = [f"{iss['field']}: {iss['detail']}" for iss in remaining_losses]
+        note_bits += [f"{iss['field']}: {iss['detail']}" for iss in review_issues]
+        result["Review Notes"] = "; ".join(note_bits)[:1000]
+
         result["_narrative"] = narrative
         result["_slices"] = slices
         result["_key_paragraphs"] = key_paragraphs
         result["_event_history"] = event_history
         result["_token_usage"] = token_usage
+        result["_provenance"] = provenance
+        result["_field_review"] = {
+            "date_of_birth": dob,
+            "age_at_decision": age_decision,
+            "initial_losses": initial_losses,
+            "remaining_losses": remaining_losses,
+            "confirmed_losses": confirmed,
+            "other_issues": review_issues,
+            "second_pass": second_pass,
+        }
         result["_banding_validation"] = validate_banding(sanitised_banded_description, record=result)
-        return result
+
+        # Re-annotate so the Needs Review flag feeds the analysis-ready gate.
+        return annotate_analysis_fields(result)
 
 def main():
     load_dotenv()
@@ -1899,6 +2699,20 @@ def print_summary(all_data, analysis_ready_data):
     if exclusion_counts:
         for reason in sorted(exclusion_counts):
             print(f"  - {reason}: {exclusion_counts[reason]}")
+
+    needs_review = sum(1 for r in all_data if str(r.get("Needs Review", "")).strip() == "Yes")
+    print(f"Rows flagged Needs Review:          {needs_review}")
+
+    # C3: per-field coverage for the eight high-value target fields. A sudden
+    # coverage drop after a prompt/schema change shows up here immediately.
+    print("\n" + "-" * 70)
+    print("KEY FIELD COVERAGE (all rows)")
+    print("-" * 70)
+    total = len(all_data) or 1
+    for field in KEY_TARGET_FIELDS:
+        populated = sum(1 for r in all_data if _value_present(r.get(field, "")))
+        pct = 100.0 * populated / total
+        print(f"  {field:<28} {populated:>5}/{len(all_data):<5} ({pct:5.1f}%)")
 
     if not analysis_ready_data:
         print("\nNo analysis-ready data to summarise.")

@@ -23,6 +23,8 @@ extraction_cache.json
 processed_cache.json.pre_*
 processed_cache.json.prepurge_*
 processed_cache.json.preretry_*
+# Pre-v3 migration backups (large data snapshots, not source)
+*.pre-v3-backup.*
 processed_cache.json.corrupted
 
 # Local analysis outputs (not source)
