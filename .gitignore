@@ -37,6 +37,8 @@ analysis_ready_payout_summary.csv
 # Local test scripts and their outputs
 test_*.py
 test_*_output.txt
+# ...but the v3 field-reliability regression suite IS tracked source
+!test_extraction_fields.py
 
 # Logs
 *.log
