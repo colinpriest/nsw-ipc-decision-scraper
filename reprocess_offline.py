@@ -10,26 +10,23 @@ against an upgraded model or prompt.
 """
 
 import os
-import csv
 import time
 import logging
-import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
 
 from nsw_court_scraper import (
     DecisionScraper,
-    DEFAULT_WORKERS,
-    RESULT_FIELDS,
     SCHEMA_VERSION,
     _is_quota_error,
-    annotate_analysis_fields,
-    build_result_record,
     cleanup_text,
-    has_valid_iso_date,
+    dataset_lock,
+    generate_reports,
+    get_worker_count,
     print_summary,
     record_austlii_data_error,
+    safe_decision_path,
 )
 
 
@@ -40,7 +37,10 @@ def reprocess_one(scraper, url, row):
         logging.warning(f"Skipping {url}: no File Saved entry")
         return None
 
-    full_path = os.path.join(scraper.output_folder, file_saved)
+    full_path = safe_decision_path(scraper.output_folder, file_saved)  # ISSUE-012
+    if not full_path:
+        logging.warning(f"Skipping {url}: unsafe File Saved path {file_saved!r}")
+        return None
     if not os.path.exists(full_path):
         logging.warning(f"Skipping {url}: local file missing ({full_path})")
         return None
@@ -138,7 +138,7 @@ def main():
         logging.info("Nothing to do — all cache rows already at current schema.")
         return
 
-    max_workers = int(os.getenv("EXTRACTION_WORKERS", str(DEFAULT_WORKERS)))
+    max_workers = get_worker_count()  # validated/clamped (ISSUE-018)
     logging.info(f"Reprocessing with {max_workers} workers...")
 
     wall_t0 = time.monotonic()
@@ -170,7 +170,8 @@ def main():
                     f.cancel()
 
             if completed % 25 == 0:
-                scraper._save_cache()
+                with dataset_lock():
+                    scraper._save_cache()
                 elapsed = time.monotonic() - wall_t0
                 rate = completed / max(elapsed, 1e-6)
                 remaining = len(targets) - completed
@@ -183,9 +184,6 @@ def main():
                     f"cost ${scraper.cost_tracker.total_cost():.2f} "
                     f"({scraper.cost_tracker.calls} calls)"
                 )
-
-    scraper._save_cache()
-    scraper._save_sidecar()
 
     wall_elapsed = time.monotonic() - wall_t0
     ct = scraper.cost_tracker
@@ -201,31 +199,15 @@ def main():
     if ct.calls:
         logging.info(f"  Mean per call:     ${ct.total_cost() / ct.calls:.4f}")
 
-    # Reports
-    with scraper.cache_lock:
-        all_data = [annotate_analysis_fields(row) for row in scraper.cache.values()]
-    analysis_ready_data = [row for row in all_data if row.get("Analysis Ready") == "Yes"]
-
-    def _decision_date_sort_key(row):
-        decision_date = (row.get("Decision Date") or "").strip()
-        return decision_date if has_valid_iso_date(decision_date) else "0000-00-00"
-
-    all_data.sort(key=_decision_date_sort_key, reverse=True)
-    analysis_ready_data.sort(key=_decision_date_sort_key, reverse=True)
-
-    if all_data:
-        with open(CSV_REPORT, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=RESULT_FIELDS, extrasaction="ignore")
-            w.writeheader()
-            w.writerows(all_data)
-        logging.info(f"Summary report saved to {CSV_REPORT}")
-
-    if analysis_ready_data:
-        with open(ANALYSIS_READY_REPORT, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=RESULT_FIELDS, extrasaction="ignore")
-            w.writeheader()
-            w.writerows(analysis_ready_data)
-        logging.info(f"Analysis-ready report saved to {ANALYSIS_READY_REPORT}")
+    # Persist cache + sidecar + reports as one locked snapshot (ISSUE-001/002/003/022).
+    with dataset_lock():
+        scraper._save_cache()
+        scraper._save_sidecar()
+        all_data, analysis_ready_data = generate_reports(
+            scraper, CSV_REPORT, ANALYSIS_READY_REPORT,
+            script="reprocess_offline",
+            manifest_extra={"quota_aborted": bool(aborted_logged), "llm_calls": ct.calls},
+        )
 
     print_summary(all_data, analysis_ready_data)
 

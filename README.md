@@ -224,6 +224,47 @@ You can modify these settings in `nsw_court_scraper.py`:
 - **NSW_EXCLUDE_NEEDS_REVIEW**: Set `0` to keep `Needs Review` rows in the analysis-ready set (default: exclude)
 - **NSW_INCOME_WEEKLY_MIN** / **NSW_INCOME_WEEKLY_MAX**: Plausible weekly-income range for the unit-error check (defaults: 50 / 15000)
 
+### Operational / reliability env vars
+
+- **EXTRACTION_WORKERS**: Worker threads. Validated and clamped to `[1, NSW_MAX_WORKERS]`; invalid values log a warning and fall back to the default (25)
+- **NSW_MAX_WORKERS**: Upper bound for worker threads (default: 64)
+- **NSW_OPENAI_TIMEOUT**: Per-request OpenAI timeout in seconds (default: 120). The SDK's own retries are disabled; the in-app backoff owns retries
+- **NSW_RUN_MANIFEST**: Path for the run-metadata manifest (default: `run_manifest.json`)
+- **NSW_DATASET_LOCK**: Path for the cross-process dataset lock file (default: `.nsw_dataset.lock`)
+
+### Privacy env vars (see "Privacy & data handling")
+
+- **NSW_PRIVACY_DROP_IDENTITY**, **NSW_PRIVACY_DROP_DOB**, **NSW_PRIVACY_DROP_PROVENANCE**: set to `1` to omit those from OUTPUTS (default: keep)
+- **NSW_PRIVACY_NAME_MODE**: `keep` (default) / `hash` / `redact` for party-name fields in outputs
+- **NSW_PRIVACY_HASH_SALT**: salt for `hash` mode
+
+## Privacy & data handling
+
+This pipeline processes **public** NSW Personal Injury Commission decisions, but it does two things worth calling out explicitly:
+
+- **Third-party processing.** Cleaned decision text is sent to the **OpenAI API** for extraction. Do not run it on material you are not permitted to send to a third-party processor.
+- **Derived dataset.** The outputs concentrate per-claimant detail (names, age, date of birth, gender, occupation, income, location, employer) plus verbatim provenance quotes.
+
+**Defaults retain everything** because DOB, provenance, and party identity are vital to the payout-vs-WPI use case. A privacy-sensitive deployment can minimise the **derived outputs** (CSV reports, sidecar, Excel) *without* changing default behaviour — the local working cache always keeps full data:
+
+| Env var | Default | Effect when set |
+|---|---|---|
+| `NSW_PRIVACY_DROP_IDENTITY=1` | keep | Blanks Applicant / Respondent / Employer Name in outputs |
+| `NSW_PRIVACY_DROP_DOB=1` | keep | Blanks date-of-birth in the sidecar |
+| `NSW_PRIVACY_DROP_PROVENANCE=1` | keep | Drops verbatim provenance quotes from the sidecar |
+| `NSW_PRIVACY_NAME_MODE=hash` | `keep` | Replaces party names with a salted hash (`NSW_PRIVACY_HASH_SALT`) |
+| `NSW_PRIVACY_NAME_MODE=redact` | `keep` | Replaces party names with `[REDACTED]` |
+
+When any privacy knob is active, the run logs a notice. Note that the anonymised `Description`/`Banded Description` already strip proper nouns by prompt design; these knobs additionally control the **structured** identity/DOB/provenance fields.
+
+## Operational artifacts & reliability
+
+- **`run_manifest.json`** (gitignored): written after every report regeneration with schema version, generated timestamp, row counts, needs-review count, stale-rows-excluded, and quota-abort status — so consumers can detect stale or empty output.
+- **Cache/sidecar/report snapshot consistency.** Cache, sidecar, and CSV reports are written together under a **cross-process lock** (`.nsw_dataset.lock`) using atomic per-process temp files, so overlapping runs can't lose updates or join current flat rows to stale nested data. Reports include only **current-schema** rows; stale-schema rows are excluded and counted.
+- **Always-written reports.** CSVs are rewritten every run, header-only when empty, so a failed/zero-row run never leaves a previous run's CSV in place masquerading as current.
+- **Quota safety.** The main scraper and the WPI backfill share the quota circuit breaker: on sustained `insufficient_quota` they cancel queued work and stop submitting instead of grinding through known-failing calls.
+- **`austlii_data_errors.json`** is an operational data artifact (litigant names / URLs) and is **gitignored**; a redacted `austlii_data_errors.sample.json` is tracked as an example.
+
 ## Important Notes
 
 ### Rate Limiting

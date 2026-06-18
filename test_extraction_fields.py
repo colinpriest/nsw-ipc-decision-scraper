@@ -359,6 +359,264 @@ def test_truncate_passthrough_when_short():
     assert ns._narrative_truncate(text) == text
 
 
+def test_truncate_prioritises_quantum_over_generic_headings():
+    # ISSUE-017: a long doc with many early generic headings, quantum only at the
+    # very end. The late quantum window must survive (priority over structure).
+    saved = ns.SINGLE_PASS_LIMIT_CHARS
+    try:
+        ns.SINGLE_PASS_LIMIT_CHARS = 40000
+        generic = ("Background. Facts. History. Reasons. Submissions. Discussion. "
+                   "Findings. Conclusion. Orders. " * 700)  # ~45k of generic headings
+        marker = " The claimant was awarded non-economic loss of $250,000 and a 14% WPI. "
+        text = generic + marker + ("end. " * 100)
+        assert len(text) > 40000
+        out = ns._narrative_truncate(text)
+        assert "non-economic loss of $250,000" in out
+        assert "14% WPI" in out
+    finally:
+        ns.SINGLE_PASS_LIMIT_CHARS = saved
+
+
+# ----------------------------------------------------------------------
+# Money coercion on Lump Sum / Weekly Benefit (ISSUE-006)
+# ----------------------------------------------------------------------
+
+def test_money_coercion_strips_trailing_text():
+    assert ns.coerce_money("$300,000 inclusive of costs") == "300000"
+    assert ns.coerce_money("Weekly $522.84 ongoing") == "522.84"
+    assert ns.coerce_money("$1,234,567.89") == "1234567.89"
+    assert ns.coerce_money("Not stated") == ""
+
+
+# ----------------------------------------------------------------------
+# Safe path resolution (ISSUE-012)
+# ----------------------------------------------------------------------
+
+def test_safe_decision_path():
+    base = "nsw_pic_decisions"
+    ok = ns.safe_decision_path(base, "Foo_2024_1.html")
+    assert ok and ok.endswith("Foo_2024_1.html")
+    # traversal / absolute / drive / alt-separator / tilde -> rejected
+    assert ns.safe_decision_path(base, "../.env") is None
+    assert ns.safe_decision_path(base, "..\\..\\secrets.txt") is None
+    assert ns.safe_decision_path(base, "/etc/passwd") is None
+    assert ns.safe_decision_path(base, "C:\\Windows\\system.ini") is None
+    assert ns.safe_decision_path(base, "~/secret") is None
+    assert ns.safe_decision_path(base, "") is None
+    assert ns.safe_decision_path(base, None) is None
+
+
+# ----------------------------------------------------------------------
+# Worker-count validation (ISSUE-018)
+# ----------------------------------------------------------------------
+
+def test_get_worker_count():
+    import os
+    saved = os.environ.get("EXTRACTION_WORKERS")
+    try:
+        os.environ["EXTRACTION_WORKERS"] = "8"
+        assert ns.get_worker_count() == 8
+        os.environ["EXTRACTION_WORKERS"] = "0"
+        assert ns.get_worker_count() == 1
+        os.environ["EXTRACTION_WORKERS"] = "-3"
+        assert ns.get_worker_count() == 1
+        os.environ["EXTRACTION_WORKERS"] = "abc"
+        assert ns.get_worker_count(default=7) == 7
+        os.environ["EXTRACTION_WORKERS"] = str(ns.MAX_WORKERS + 100)
+        assert ns.get_worker_count() == ns.MAX_WORKERS
+    finally:
+        if saved is None:
+            os.environ.pop("EXTRACTION_WORKERS", None)
+        else:
+            os.environ["EXTRACTION_WORKERS"] = saved
+
+
+# ----------------------------------------------------------------------
+# Privacy transforms (ISSUE-011) — default keeps everything
+# ----------------------------------------------------------------------
+
+def test_privacy_default_is_noop():
+    assert not ns.privacy_active()
+    row = {"Applicant": "Jane Smith", "Respondent": "QBE", "Employer Name": "Acme"}
+    assert ns.apply_privacy_to_row(row) == row  # default: unchanged
+    sc = {"provenance": {"wpi_quote": "x"}, "field_review": {"date_of_birth": "1980"}}
+    assert ns.apply_privacy_to_sidecar(sc) == sc
+
+
+def test_privacy_redact_and_drop():
+    # Toggle module-level flags directly (they're read at import from env).
+    saved = (ns.PRIVACY_DROP_IDENTITY, ns.PRIVACY_DROP_DOB, ns.PRIVACY_DROP_PROVENANCE,
+             ns.PRIVACY_NAME_MODE)
+    try:
+        ns.PRIVACY_NAME_MODE = "redact"
+        assert ns.privacy_active()
+        row = {"Applicant": "Jane Smith", "Respondent": "QBE", "Employer Name": ""}
+        out = ns.apply_privacy_to_row(row)
+        assert out["Applicant"] == "[REDACTED]" and out["Respondent"] == "[REDACTED]"
+        assert out["Employer Name"] == ""  # empty stays empty
+        # hash mode is stable
+        ns.PRIVACY_NAME_MODE = "hash"
+        h1 = ns.apply_privacy_to_row({"Applicant": "Jane Smith"})["Applicant"]
+        h2 = ns.apply_privacy_to_row({"Applicant": "Jane Smith"})["Applicant"]
+        assert h1 == h2 and h1.startswith("name_") and "Jane" not in h1
+        # drop DOB + provenance in sidecar
+        ns.PRIVACY_NAME_MODE = "keep"
+        ns.PRIVACY_DROP_DOB = True
+        ns.PRIVACY_DROP_PROVENANCE = True
+        sc = ns.apply_privacy_to_sidecar(
+            {"provenance": {"wpi_quote": "x"}, "field_review": {"date_of_birth": "1980-01-01"}})
+        assert sc["provenance"] == {} and sc["field_review"]["date_of_birth"] == ""
+    finally:
+        (ns.PRIVACY_DROP_IDENTITY, ns.PRIVACY_DROP_DOB, ns.PRIVACY_DROP_PROVENANCE,
+         ns.PRIVACY_NAME_MODE) = saved
+
+
+# ----------------------------------------------------------------------
+# Integration: report generation + Excel filter (ISSUE-019/001/005)
+# ----------------------------------------------------------------------
+
+def _seed_cache_row(url, **over):
+    return ns.build_result_record(f"Case {url}", url, status="ok", **over)
+
+
+def test_regenerate_reports_always_writes_and_filters_schema():
+    import os, csv, json, tempfile
+    d = tempfile.mkdtemp()
+    cwd = os.getcwd()
+    try:
+        os.chdir(d)
+        cache = {}
+        # current-schema, analysis-ready CTP row
+        cache["u1"] = _seed_cache_row("u1", **{
+            "Case Type": "CTP", "Decision Date": "2024-03-01",
+            "Lump Sum": "200000", "Impairment % (Accepted)": "14"})
+        # current-schema but not analysis-ready (bad date)
+        cache["u2"] = _seed_cache_row("u2", **{"Decision Date": "Unknown"})
+        # stale schema -> excluded entirely
+        stale = _seed_cache_row("u3", **{"Decision Date": "2024-01-01"})
+        stale["_schema_version"] = 1
+        cache["u3"] = stale
+
+        det, rdy = "d.csv", "r.csv"
+        all_data, ready = ns.regenerate_reports_from_cache(cache, det, rdy, script="test")
+        assert os.path.exists(det) and os.path.exists(rdy)
+        urls = {r["URL"] for r in all_data}
+        assert urls == {"u1", "u2"}          # stale u3 excluded
+        assert {r["URL"] for r in ready} == {"u1"}  # only the analysis-ready one
+        # manifest written with counts
+        man = json.load(open("run_manifest.json", encoding="utf-8"))
+        assert man["total_rows"] == 2 and man["analysis_ready_rows"] == 1
+        assert man["stale_rows_excluded"] == 1
+
+        # Empty cache -> header-only CSVs (ISSUE-001), no crash
+        ns.regenerate_reports_from_cache({}, det, rdy, script="test")
+        with open(rdy, encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        assert len(rows) == 1 and rows[0][0] == "Case Name"  # header only
+    finally:
+        os.chdir(cwd)
+
+
+def test_ctp_excel_requires_accepted_wpi():
+    import pandas as pd
+    import ctp_lump_sum_impairment as ctp
+    df = pd.DataFrame([
+        {"URL": "a", "Case Type": "CTP", "Analysis Ready": "Yes",
+         "Lump Sum": "200000", "Impairment % (Accepted)": "14"},   # kept
+        {"URL": "b", "Case Type": "CTP", "Analysis Ready": "Yes",
+         "Lump Sum": "150000", "Impairment % (Accepted)": ""},     # dropped: no WPI
+    ])
+    out, _ = ctp.build_workbook(df, {})
+    assert list(out["URL"]) == ["a"]          # row b excluded (ISSUE-005)
+    assert "WPI %" in out.columns and "Impairment % (Accepted)" not in out.columns
+
+
+# ----------------------------------------------------------------------
+# Mocked LLM retry / quota / timeout (ISSUE-020)
+# ----------------------------------------------------------------------
+
+class _APITimeoutError(Exception):
+    pass
+
+
+def _fake_completion(parsed_obj):
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(parsed=parsed_obj))],
+        usage=None,
+    )
+
+
+class _FakeParseAPI:
+    def __init__(self, behaviors):
+        self.behaviors = list(behaviors)
+        self.calls = 0
+
+    def parse(self, **kw):
+        b = self.behaviors[min(self.calls, len(self.behaviors) - 1)]
+        self.calls += 1
+        if isinstance(b, Exception):
+            raise b
+        return _fake_completion(b)
+
+
+def _extractor_with(behaviors, monkeypatch_sleep=True):
+    ex = ns.LLMExtractor.__new__(ns.LLMExtractor)  # bypass real OpenAI init
+    ex.client = SimpleNamespace(beta=SimpleNamespace(
+        chat=SimpleNamespace(completions=_FakeParseAPI(behaviors))))
+    return ex
+
+
+def test_parse_retries_quota_then_succeeds():
+    saved = ns.time.sleep
+    ns.time.sleep = lambda *a, **k: None
+    try:
+        quota = Exception("Error code: 429 insufficient_quota: exceeded your current quota")
+        ex = _extractor_with([quota, quota, "OK"])
+        parsed, usage, err = ex._parse_with_retry("sys", "user", str)
+        assert parsed == "OK" and err is None
+        assert ex.client.beta.chat.completions.calls == 3
+    finally:
+        ns.time.sleep = saved
+
+
+def test_parse_retries_timeout_then_succeeds():
+    saved = ns.time.sleep
+    ns.time.sleep = lambda *a, **k: None
+    try:
+        ex = _extractor_with([_APITimeoutError("request timed out"), "OK"])
+        parsed, usage, err = ex._parse_with_retry("sys", "user", str)
+        assert parsed == "OK" and err is None
+    finally:
+        ns.time.sleep = saved
+
+
+def test_parse_non_retryable_returns_error_immediately():
+    ex = _extractor_with([Exception("schema validation failed: bad field")])
+    parsed, usage, err = ex._parse_with_retry("sys", "user", str)
+    assert parsed is None and "schema validation" in err
+    assert ex.client.beta.chat.completions.calls == 1  # no retry
+
+
+def test_quota_breaker_trips_after_threshold_when_cold():
+    b = ns.QuotaCircuitBreaker(threshold=2, cold_window_seconds=0)
+    assert not b.is_aborted()
+    b.record_quota_error()
+    assert not b.is_aborted()       # below threshold
+    b.record_quota_error()
+    assert b.is_aborted()           # threshold reached + cold window 0
+    b2 = ns.QuotaCircuitBreaker(threshold=2, cold_window_seconds=0)
+    b2.record_quota_error()
+    b2.record_success()             # success resets the consecutive count
+    b2.record_quota_error()
+    assert not b2.is_aborted()
+
+
+def test_is_transient_api_error():
+    assert ns._is_transient_api_error(_APITimeoutError("x"))
+    assert ns._is_transient_api_error(Exception("Connection error."))
+    assert not ns._is_transient_api_error(Exception("bad schema"))
+
+
 # ----------------------------------------------------------------------
 # Standalone runner
 # ----------------------------------------------------------------------

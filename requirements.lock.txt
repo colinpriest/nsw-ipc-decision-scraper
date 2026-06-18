@@ -1,0 +1,13 @@
+# Exact pins for a fully reproducible environment (ISSUE-023).
+# Generated from the known-good environment; refresh intentionally with:
+#   pip install -r requirements.txt && pip freeze > requirements.lock.txt
+# then run the test suite before committing the update.
+requests==2.32.3
+curl_cffi==0.12.0
+beautifulsoup4==4.12.3
+openai==1.109.1
+python-dotenv==1.0.1
+pydantic==2.10.3
+pandas==3.0.3
+openpyxl==3.1.5
+pypdf==5.9.0

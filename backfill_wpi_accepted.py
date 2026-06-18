@@ -13,7 +13,7 @@ where set — any WPI the main extractor judged "made in this proceeding" is
 necessarily also "accepted as basis of award".
 """
 
-import csv
+import io
 import json
 import logging
 import os
@@ -22,22 +22,27 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
 from openai import OpenAI
+from pypdf import PdfReader
 from pydantic import BaseModel, Field
 
 from nsw_court_scraper import (
-    DEFAULT_WORKERS,
     MODEL,
+    OPENAI_TIMEOUT,
     PRICE_INPUT_PER_M,
     PRICE_CACHED_INPUT_PER_M,
     PRICE_OUTPUT_PER_M,
     REASONING_EFFORT,
-    RESULT_FIELDS,
+    QuotaCircuitBreaker,
     _is_quota_error,
-    annotate_analysis_fields,
+    _is_transient_api_error,
+    atomic_write_json,
     cleanup_text,
+    dataset_lock,
     extract_html_with_paragraph_numbers,
     extract_wpi_confident,
-    has_valid_iso_date,
+    get_worker_count,
+    regenerate_reports_from_cache,
+    safe_decision_path,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -108,7 +113,8 @@ Only return 10 when the decision states the claimant was actually ASSESSED at
 # ----------------------------------------------------------------------
 
 def call_focused_extraction(client, source_text, context=""):
-    """Returns (parsed, usage, error). Retries on insufficient_quota."""
+    """Returns (parsed, usage, error). Retries on insufficient_quota and on
+    transient timeout/connection errors (ISSUE-016)."""
     user = (
         "Source text of the decision follows. Extract WPI information.\n\n"
         "---\n"
@@ -129,9 +135,10 @@ def call_focused_extraction(client, source_text, context=""):
             )
             return r.choices[0].message.parsed, r.usage, None
         except Exception as e:
-            if _is_quota_error(str(e)) and attempt < len(backoff):
+            if (_is_quota_error(str(e)) or _is_transient_api_error(e)) and attempt < len(backoff):
                 delay = backoff[attempt]
-                logging.warning(f"insufficient_quota ({context}) - retry {attempt+1} in {delay}s")
+                kind = "insufficient_quota" if _is_quota_error(str(e)) else "timeout/connection"
+                logging.warning(f"{kind} ({context}) - retry {attempt+1} in {delay}s")
                 time.sleep(delay)
                 continue
             logging.error(f"WPI focused extraction error ({context}): {e}")
@@ -168,14 +175,36 @@ def is_numeric(v):
         return False
 
 
+def _pdf_to_text(data):
+    """Extract text from PDF bytes (ISSUE-007)."""
+    try:
+        reader = PdfReader(io.BytesIO(data))
+    except Exception as e:
+        logging.warning(f"Unable to open PDF for WPI backfill: {e}")
+        return ""
+    pages = []
+    for page in reader.pages:
+        try:
+            t = page.extract_text() or ""
+        except Exception:
+            t = ""
+        if t.strip():
+            pages.append(t.strip())
+    return "\n\n".join(pages).strip()
+
+
 def read_local_text(file_saved):
-    path = os.path.join(OUTPUT_DIR, file_saved)
-    if not os.path.exists(path):
+    """Read a cached decision's text. Handles HTML AND PDF (ISSUE-007), and
+    constrains the path to OUTPUT_DIR (ISSUE-012)."""
+    path = safe_decision_path(OUTPUT_DIR, file_saved)
+    if not path or not os.path.exists(path):
+        if file_saved and not path:
+            logging.warning(f"Rejected unsafe File Saved path: {file_saved!r}")
         return None
-    if file_saved.lower().endswith(".pdf"):
-        return None  # PDFs require pdf extractor — skip in this backfill
     with open(path, "rb") as f:
         data = f.read()
+    if file_saved.lower().endswith(".pdf"):
+        return cleanup_text(_pdf_to_text(data))
     return cleanup_text(extract_html_with_paragraph_numbers(data))
 
 
@@ -244,20 +273,26 @@ def main():
     logging.info(f"Stage 2 (focused LLM) candidates: {len(stage2_needed)}")
 
     # Save cache after stage 1 so a stage-2 failure doesn't lose stage-1 work
-    _save_cache(cache)
+    with dataset_lock():
+        _save_cache(cache)
 
     # ---- Stage 2: focused LLM ----
     if stage2_needed:
-        client = OpenAI(api_key=api_key)
+        # Explicit timeout + our own retry policy (ISSUE-016).
+        client = OpenAI(api_key=api_key, timeout=OPENAI_TIMEOUT, max_retries=0)
+        breaker = QuotaCircuitBreaker()  # abort on sustained quota failure (ISSUE-014)
         total_cost = 0.0
         stage2_filled = stage2_failed = 0
+        aborted_logged = False
 
         def worker(url, row, text):
+            if breaker.is_aborted():
+                return url, row, None, None, "aborted"
             ctx = f"url={url}"
             parsed, usage, err = call_focused_extraction(client, text, context=ctx)
             return url, row, parsed, usage, err
 
-        max_workers = int(os.getenv("EXTRACTION_WORKERS", str(DEFAULT_WORKERS)))
+        max_workers = get_worker_count()
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = {ex.submit(worker, u, r, t): (u, r) for u, r, t in stage2_needed}
             for i, fut in enumerate(as_completed(futures), 1):
@@ -270,7 +305,21 @@ def main():
                 total_cost += estimate_cost(usage)
                 if err or parsed is None:
                     stage2_failed += 1
+                    # Feed the quota breaker so a real billing cap aborts the
+                    # backfill instead of grinding through every candidate.
+                    if _is_quota_error(err):
+                        breaker.record_quota_error()
+                    elif err != "aborted":
+                        breaker.record_non_quota_error()
+                    if breaker.is_aborted() and not aborted_logged:
+                        aborted_logged = True
+                        logging.error(
+                            f"QUOTA BREAKER TRIPPED at stage-2 item {i}/{len(stage2_needed)} — "
+                            f"cancelling remaining WPI backfill calls. Top up and re-run.")
+                        for f in futures:
+                            f.cancel()
                     continue
+                breaker.record_success()
                 # Patch only the impairment fields; preserve everything else.
                 # Treat "0" as unknown — see extract_wpi_confident comment.
                 def _clean(s):
@@ -290,42 +339,20 @@ def main():
 
                 if i % 25 == 0:
                     logging.info(f"  stage 2 progress: {i}/{len(stage2_needed)}  cost ${total_cost:.2f}")
-                    _save_cache(cache)
+                    with dataset_lock():
+                        _save_cache(cache)
 
-        _save_cache(cache)
         logging.info(f"Stage 2 filled: {stage2_filled}  failed: {stage2_failed}  cost ${total_cost:.2f}")
 
-    # ---- Regenerate CSVs ----
-    all_data = [annotate_analysis_fields(row) for row in cache.values()]
-    analysis_ready = [r for r in all_data if r.get("Analysis Ready") == "Yes"]
-
-    def sort_key(r):
-        d = (r.get("Decision Date") or "").strip()
-        return d if has_valid_iso_date(d) else "0000-00-00"
-
-    all_data.sort(key=sort_key, reverse=True)
-    analysis_ready.sort(key=sort_key, reverse=True)
-
-    if all_data:
-        with open(CSV_REPORT, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=RESULT_FIELDS, extrasaction="ignore")
-            w.writeheader()
-            w.writerows(all_data)
-        logging.info(f"Rewrote {CSV_REPORT} ({len(all_data)} rows)")
-
-    if analysis_ready:
-        with open(ANALYSIS_READY_REPORT, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=RESULT_FIELDS, extrasaction="ignore")
-            w.writeheader()
-            w.writerows(analysis_ready)
-        logging.info(f"Rewrote {ANALYSIS_READY_REPORT} ({len(analysis_ready)} rows)")
+    # ---- Regenerate CSVs (always-write, atomic, manifest) ----
+    with dataset_lock():
+        _save_cache(cache)
+        regenerate_reports_from_cache(
+            cache, CSV_REPORT, ANALYSIS_READY_REPORT, script="backfill_wpi_accepted")
 
 
 def _save_cache(cache):
-    tmp = CACHE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cache, f, indent=2, default=str)
-    os.replace(tmp, CACHE_FILE)
+    atomic_write_json(CACHE_FILE, cache)
 
 
 if __name__ == "__main__":

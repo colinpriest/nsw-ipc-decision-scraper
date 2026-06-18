@@ -9,18 +9,19 @@ Conservative — runs only on rows where:
   - Derived age is in [0, 120]
 """
 
-import csv
 import json
 import logging
 import os
 import re
 
 from nsw_court_scraper import (
-    RESULT_FIELDS,
-    annotate_analysis_fields,
+    atomic_write_json,
     cleanup_text,
+    dataset_lock,
     extract_html_with_paragraph_numbers,
     has_valid_iso_date,
+    regenerate_reports_from_cache,
+    safe_decision_path,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -71,8 +72,10 @@ def main():
         fname = row.get("File Saved") or ""
         if not fname or fname.lower().endswith(".pdf"):
             continue
-        path = os.path.join(OUTPUT_DIR, fname)
-        if not os.path.exists(path):
+        path = safe_decision_path(OUTPUT_DIR, fname)  # ISSUE-012
+        if not path or not os.path.exists(path):
+            if fname and not path:
+                logging.warning(f"Rejected unsafe File Saved path: {fname!r}")
             continue
 
         with open(path, "rb") as f:
@@ -100,32 +103,12 @@ def main():
     for name, yob, iy, age in sample:
         logging.info(f"    yob={yob}  injury_year={iy}  age={age}   {name}")
 
-    # Save cache
-    tmp = CACHE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cache, f, indent=2, default=str)
-    os.replace(tmp, CACHE_FILE)
-
-    # Regenerate CSVs
-    all_data = [annotate_analysis_fields(row) for row in cache.values()]
-    analysis_ready = [r for r in all_data if r.get("Analysis Ready") == "Yes"]
-
-    def sk(r):
-        d = (r.get("Decision Date") or "").strip()
-        return d if has_valid_iso_date(d) else "0000-00-00"
-
-    all_data.sort(key=sk, reverse=True)
-    analysis_ready.sort(key=sk, reverse=True)
-
-    for path, data in [
-        ("detailed_payout_summary.csv", all_data),
-        ("analysis_ready_payout_summary.csv", analysis_ready),
-    ]:
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=RESULT_FIELDS, extrasaction="ignore")
-            w.writeheader()
-            w.writerows(data)
-        logging.info(f"Rewrote {path} ({len(data)} rows)")
+    # Save cache + regenerate CSVs (atomic, always-write, manifest) under lock.
+    with dataset_lock():
+        atomic_write_json(CACHE_FILE, cache)
+        regenerate_reports_from_cache(
+            cache, "detailed_payout_summary.csv", "analysis_ready_payout_summary.csv",
+            script="backfill_age_from_dob")
 
 
 if __name__ == "__main__":

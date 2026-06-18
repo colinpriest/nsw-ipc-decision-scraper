@@ -1,0 +1,15 @@
+{
+  "https://www.austlii.edu.au/cgi-bin/viewdoc/au/cases/nsw/NSWPIC/2099/0.html": {
+    "url": "https://www.austlii.edu.au/cgi-bin/viewdoc/au/cases/nsw/NSWPIC/2099/0.html",
+    "case_name": "[REDACTED SAMPLE] Applicant v Respondent [2099] NSWPIC 0",
+    "error_type": "html_no_content",
+    "first_detected_at": "2099-01-01T00:00:00",
+    "last_detected_at": "2099-01-01T00:00:00",
+    "detection_count": 1,
+    "local_file": "REDACTED_SAMPLE_2099_0.html",
+    "extracted_chars": 0,
+    "notes": "Redacted example fixture. The real austlii_data_errors.json is an operational artifact (contains litigant names / case URLs) and is gitignored (ISSUE-010). AustLII served an empty document body; decision indexed but not retrievable; needs a manually sourced copy.",
+    "live_verified": false,
+    "resolved": false
+  }
+}

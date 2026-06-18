@@ -23,9 +23,16 @@ extraction_cache.json
 processed_cache.json.pre_*
 processed_cache.json.prepurge_*
 processed_cache.json.preretry_*
+processed_cache.json.corrupted*
 # Pre-v3 migration backups (large data snapshots, not source)
 *.pre-v3-backup.*
-processed_cache.json.corrupted
+# Operational data artifact: generated legal-case error log (ISSUE-010).
+# Contains litigant names / URLs; tracked sample is austlii_data_errors.sample.json
+austlii_data_errors.json
+# Run metadata + lock + live-smoke output (operational, not source)
+run_manifest.json
+.nsw_dataset.lock
+smoke_full_sample_output.txt
 
 # Local analysis outputs (not source)
 ctp_impairment_lump_sum.xlsx

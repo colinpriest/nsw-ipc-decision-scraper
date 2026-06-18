@@ -6,18 +6,18 @@ Rows where extraction returns empty are left with Catchwords="" so the parse
 gap is visible in the CSV without polluting the data.
 """
 
-import csv
 import json
 import logging
 import os
 
 from nsw_court_scraper import (
-    RESULT_FIELDS,
-    annotate_analysis_fields,
+    atomic_write_json,
     cleanup_text,
+    dataset_lock,
     extract_catchwords,
     extract_html_with_paragraph_numbers,
-    has_valid_iso_date,
+    regenerate_reports_from_cache,
+    safe_decision_path,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -37,11 +37,10 @@ def backfill():
         if not isinstance(row, dict):
             continue
         fname = row.get("File Saved") or ""
-        if not fname:
-            no_file += 1
-            continue
-        path = os.path.join(OUTPUT_DIR, fname)
-        if not os.path.exists(path):
+        path = safe_decision_path(OUTPUT_DIR, fname)  # ISSUE-012
+        if not path or not os.path.exists(path):
+            if fname and not path:
+                logging.warning(f"Rejected unsafe File Saved path: {fname!r}")
             no_file += 1
             continue
 
@@ -72,39 +71,15 @@ def backfill():
         if not catchwords:
             empty_catchwords += 1
 
-    # Atomic write
-    tmp = CACHE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cache, f, indent=2, default=str)
-    os.replace(tmp, CACHE_FILE)
-
     logging.info(f"Backfill complete: {updated} updated, {unchanged} unchanged, "
                  f"{no_file} skipped (missing file), {empty_catchwords} rows have empty catchwords.")
 
-    # Regenerate CSVs so the new column is visible
-    all_data = [annotate_analysis_fields(row) for row in cache.values()]
-    analysis_ready = [r for r in all_data if r.get("Analysis Ready") == "Yes"]
-
-    def sort_key(r):
-        d = (r.get("Decision Date") or "").strip()
-        return d if has_valid_iso_date(d) else "0000-00-00"
-
-    all_data.sort(key=sort_key, reverse=True)
-    analysis_ready.sort(key=sort_key, reverse=True)
-
-    if all_data:
-        with open(CSV_REPORT, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=RESULT_FIELDS, extrasaction="ignore")
-            w.writeheader()
-            w.writerows(all_data)
-        logging.info(f"Rewrote {CSV_REPORT} ({len(all_data)} rows)")
-
-    if analysis_ready:
-        with open(ANALYSIS_READY_REPORT, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=RESULT_FIELDS, extrasaction="ignore")
-            w.writeheader()
-            w.writerows(analysis_ready)
-        logging.info(f"Rewrote {ANALYSIS_READY_REPORT} ({len(analysis_ready)} rows)")
+    # Persist cache + regenerate CSVs (atomic, always-write, manifest) under the
+    # shared dataset lock (ISSUE-001/002/003).
+    with dataset_lock():
+        atomic_write_json(CACHE_FILE, cache)
+        regenerate_reports_from_cache(
+            cache, CSV_REPORT, ANALYSIS_READY_REPORT, script="backfill_catchwords")
 
 
 if __name__ == "__main__":

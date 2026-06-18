@@ -16,7 +16,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 import datetime
 import random
 from threading import Lock
@@ -122,6 +122,262 @@ SINGLE_PASS_LIMIT_CHARS = int(os.getenv("NSW_SINGLE_PASS_LIMIT_CHARS", "200000")
 PRICE_INPUT_PER_M = float(os.getenv("GPT5_PRICE_INPUT_PER_M", "1.25"))
 PRICE_CACHED_INPUT_PER_M = float(os.getenv("GPT5_PRICE_CACHED_INPUT_PER_M", "0.125"))
 PRICE_OUTPUT_PER_M = float(os.getenv("GPT5_PRICE_OUTPUT_PER_M", "10.00"))
+
+# Application-level timeout (seconds) for each OpenAI request (ISSUE-016). The
+# SDK's own retries are disabled (max_retries=0) so our _parse_with_retry owns
+# the retry/backoff policy; a stalled call fails after this deadline instead of
+# occupying a worker thread indefinitely.
+OPENAI_TIMEOUT = float(os.getenv("NSW_OPENAI_TIMEOUT", "120"))
+
+# Worker-count bounds (ISSUE-018).
+MAX_WORKERS = int(os.getenv("NSW_MAX_WORKERS", "64"))
+
+# Operational artifacts.
+RUN_MANIFEST_FILE = os.getenv("NSW_RUN_MANIFEST", "run_manifest.json")
+DATASET_LOCK_PATH = os.getenv("NSW_DATASET_LOCK", ".nsw_dataset.lock")
+
+
+# ----------------------------------------------------------------------
+# Privacy / data-handling configuration (ISSUE-011)
+# ----------------------------------------------------------------------
+#
+# DEFAULTS RETAIN EVERYTHING. This pipeline processes PUBLIC NSW Personal Injury
+# Commission decisions, and DOB, per-field provenance quotes, and party identity
+# are VITAL to the payout-vs-WPI use case — so by default nothing is dropped,
+# hashed, or redacted. The knobs below let a privacy-sensitive deployment
+# minimise the DERIVED OUTPUTS (CSV reports, sidecar, Excel) without changing
+# default behaviour; the local working cache always retains full data.
+#
+# THIRD-PARTY PROCESSING NOTICE: decision text is sent to the OpenAI API for
+# extraction. See the "Privacy & data handling" section of README.md.
+def _flag(name, default="0"):
+    return os.getenv(name, default).strip().lower() not in ("", "0", "false", "no", "off")
+
+PRIVACY_DROP_IDENTITY = _flag("NSW_PRIVACY_DROP_IDENTITY")      # blank Applicant/Respondent/Employer in outputs
+PRIVACY_DROP_DOB = _flag("NSW_PRIVACY_DROP_DOB")               # blank date-of-birth in sidecar outputs
+PRIVACY_DROP_PROVENANCE = _flag("NSW_PRIVACY_DROP_PROVENANCE")  # drop verbatim provenance quotes in sidecar outputs
+PRIVACY_NAME_MODE = os.getenv("NSW_PRIVACY_NAME_MODE", "keep").strip().lower()  # keep | hash | redact
+PRIVACY_HASH_SALT = os.getenv("NSW_PRIVACY_HASH_SALT", "")
+
+IDENTITY_NAME_FIELDS = ("Applicant", "Respondent", "Employer Name")
+
+
+def privacy_active():
+    return (PRIVACY_DROP_IDENTITY or PRIVACY_DROP_DOB or PRIVACY_DROP_PROVENANCE
+            or PRIVACY_NAME_MODE in ("hash", "redact"))
+
+
+def privacy_summary():
+    return {
+        "drop_identity": PRIVACY_DROP_IDENTITY,
+        "drop_dob": PRIVACY_DROP_DOB,
+        "drop_provenance": PRIVACY_DROP_PROVENANCE,
+        "name_mode": PRIVACY_NAME_MODE,
+    }
+
+
+def _transform_name(value):
+    s = str(value or "")
+    if not s.strip() or PRIVACY_NAME_MODE == "keep":
+        return s
+    if PRIVACY_NAME_MODE == "redact":
+        return "[REDACTED]"
+    if PRIVACY_NAME_MODE == "hash":
+        h = hashlib.sha256((PRIVACY_HASH_SALT + s).encode("utf-8")).hexdigest()[:12]
+        return f"name_{h}"
+    return s
+
+
+def apply_privacy_to_row(row):
+    """Return a (possibly transformed) flat CSV row per the privacy config.
+    No-op unless a privacy knob is set; defaults keep all fields."""
+    if not privacy_active():
+        return row
+    r = dict(row)
+    for f in IDENTITY_NAME_FIELDS:
+        if r.get(f):
+            r[f] = "" if PRIVACY_DROP_IDENTITY else _transform_name(r[f])
+    return r
+
+
+def apply_privacy_to_sidecar(entry):
+    """Return a (possibly transformed) sidecar entry per the privacy config."""
+    if not privacy_active():
+        return entry
+    e = dict(entry)
+    if PRIVACY_DROP_PROVENANCE:
+        e["provenance"] = {}
+    if PRIVACY_DROP_DOB:
+        fr = dict(e.get("field_review") or {})
+        if "date_of_birth" in fr:
+            fr["date_of_birth"] = ""
+        e["field_review"] = fr
+    if PRIVACY_DROP_IDENTITY and e.get("Case Name"):
+        e["Case Name"] = _transform_name(e["Case Name"])
+    return e
+
+
+# ----------------------------------------------------------------------
+# Safe local-file path resolution (ISSUE-012)
+# ----------------------------------------------------------------------
+
+def safe_decision_path(output_dir, file_saved):
+    """Resolve a cached `File Saved` value to a path INSIDE output_dir, or None.
+
+    Rejects empty values, absolute paths, drive-qualified paths, and any value
+    that escapes output_dir via traversal or alternate separators. The cache is
+    a local trust boundary: a corrupted/edited/poisoned row must never let a
+    script read (and then send to the LLM) files outside the decisions dir."""
+    if not file_saved or not isinstance(file_saved, str):
+        return None
+    fs = file_saved.strip().replace("\\", "/")
+    if not fs or fs.startswith("/") or ":" in fs or fs.startswith("~"):
+        return None
+    base = os.path.abspath(output_dir)
+    candidate = os.path.abspath(os.path.join(base, fs))
+    if candidate != base and not candidate.startswith(base + os.sep):
+        return None
+    return candidate
+
+
+# ----------------------------------------------------------------------
+# Worker-count validation (ISSUE-018)
+# ----------------------------------------------------------------------
+
+def get_worker_count(env_var="EXTRACTION_WORKERS", default=None):
+    """Parse a worker count from env, clamped to [1, MAX_WORKERS]. Invalid or
+    out-of-range values log a warning and fall back to the default."""
+    if default is None:
+        default = DEFAULT_WORKERS
+    raw = os.getenv(env_var)
+    if raw is None or str(raw).strip() == "":
+        return max(1, min(default, MAX_WORKERS))
+    try:
+        n = int(str(raw).strip())
+    except (TypeError, ValueError):
+        logging.warning(f"{env_var}={raw!r} is not an integer; using default {default}")
+        return max(1, min(default, MAX_WORKERS))
+    if n < 1:
+        logging.warning(f"{env_var}={n} < 1; using 1")
+        return 1
+    if n > MAX_WORKERS:
+        logging.warning(f"{env_var}={n} exceeds MAX_WORKERS={MAX_WORKERS}; clamping")
+        return MAX_WORKERS
+    return n
+
+
+# ----------------------------------------------------------------------
+# Cross-process dataset lock + atomic writes + run manifest (ISSUE-002/003/022)
+# ----------------------------------------------------------------------
+
+class _FileLock:
+    """Best-effort advisory cross-process lock via an O_EXCL lock file.
+
+    NOT reentrant — callers must not nest acquisitions in the same process.
+    Save/report helpers therefore do NOT self-lock; call sites wrap a whole
+    save+report batch in a single `with dataset_lock():`."""
+
+    def __init__(self, lock_path, timeout=600, poll=0.5, stale_after=7200):
+        self.lock_path = lock_path
+        self.timeout = timeout
+        self.poll = poll
+        self.stale_after = stale_after
+
+    def __enter__(self):
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, f"pid={os.getpid()} at={datetime.datetime.now().isoformat()}".encode())
+                os.close(fd)
+                return self
+            except FileExistsError:
+                try:
+                    if time.time() - os.path.getmtime(self.lock_path) > self.stale_after:
+                        logging.warning(f"Removing stale dataset lock: {self.lock_path}")
+                        os.remove(self.lock_path)
+                        continue
+                except OSError:
+                    pass
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        f"Could not acquire dataset lock {self.lock_path} within {self.timeout}s "
+                        f"(another scraper/backfill run may be active)")
+                time.sleep(self.poll)
+
+    def __exit__(self, *exc):
+        try:
+            os.remove(self.lock_path)
+        except OSError:
+            pass
+        return False
+
+
+def dataset_lock(timeout=600):
+    """Context manager: cross-process exclusion around shared cache/sidecar/
+    report writes (ISSUE-003)."""
+    return _FileLock(DATASET_LOCK_PATH, timeout=timeout)
+
+
+def _per_proc_tmp(path):
+    return f"{path}.tmp.{os.getpid()}"
+
+
+def atomic_write_json(path, obj, **dump_kwargs):
+    """Write JSON via a per-process temp file + os.replace (ISSUE-002/003)."""
+    tmp = _per_proc_tmp(path)
+    dump_kwargs.setdefault("indent", 2)
+    dump_kwargs.setdefault("default", str)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, **dump_kwargs)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def atomic_write_csv(path, fieldnames, rows):
+    """Write a CSV via a per-process temp file + os.replace. ALWAYS writes the
+    header, even for an empty row set (ISSUE-001)."""
+    tmp = _per_proc_tmp(path)
+    try:
+        with open(tmp, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(rows or [])
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def write_run_manifest(*, script, total_rows, analysis_ready_rows, needs_review_rows,
+                       path=RUN_MANIFEST_FILE, **extra):
+    """Write a small run-metadata manifest so consumers can detect stale/empty
+    outputs (ISSUE-001/002/015/022)."""
+    manifest = {
+        "script": script,
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "total_rows": total_rows,
+        "analysis_ready_rows": analysis_ready_rows,
+        "needs_review_rows": needs_review_rows,
+        "privacy": privacy_summary(),
+    }
+    manifest.update(extra)
+    try:
+        atomic_write_json(path, manifest)
+        logging.info(f"Run manifest written to {path}: {total_rows} rows, "
+                     f"{analysis_ready_rows} analysis-ready, {needs_review_rows} needs-review")
+    except OSError as e:
+        logging.error(f"Failed to write run manifest {path}: {e}")
 
 
 def has_valid_iso_date(value):
@@ -1515,6 +1771,18 @@ def _is_quota_error(error_text):
     return "insufficient_quota" in s or "exceeded your current quota" in s
 
 
+def _is_transient_api_error(error):
+    """Return True for timeout/connection-style OpenAI errors that are worth
+    retrying and should be logged distinctly from schema/parse failures
+    (ISSUE-016)."""
+    name = type(error).__name__.lower()
+    if "timeout" in name or "connection" in name:
+        return True
+    s = str(error).lower()
+    return ("timed out" in s or "timeout" in s or "connection error" in s
+            or "temporarily unavailable" in s)
+
+
 class QuotaCircuitBreaker:
     """Abort the run only on SUSTAINED insufficient_quota failure.
 
@@ -1801,61 +2069,97 @@ Personal Injury Commission decision. Produce one structured response with:
 """
 
 
+# Quantum / claimant-profile keywords — where the eight high-value target
+# fields live. These are filled FIRST so they win the truncation budget even in
+# a very long decision whose generic structural headings come earlier (ISSUE-017).
+_TRUNCATE_TARGET_KEYWORDS = (
+    "non-economic loss", "non economic loss", "general damages", "pain and suffering",
+    "future economic loss", "loss of earning", "earning capacity", "buffer", "quantum",
+    "damages assessment", "whole person impairment", "impairment", "wpi",
+    "piawe", "per week", "weekly", "pre-injury", "salary", "wage",
+    "date of birth", "born", "aged", "occupation", "employed",
+)
+# Generic structural headings — lower priority; dropped first when the cap binds.
+_TRUNCATE_STRUCTURE_KEYWORDS = (
+    "background", "facts", "history", "particulars", "mechanism", "medical evidence",
+    "pre-existing", "treatment", "diagnosis", "surgery", "expert evidence", "submissions",
+    "reasoning", "findings", "reasons", "discussion", "issues", "orders", "conclusion", "decision",
+)
+_TRUNCATE_BEFORE, _TRUNCATE_AFTER = 3000, 10000
+
+
+def _merge_ranges(ranges):
+    """Merge a list of [start, end) into sorted, non-overlapping ranges."""
+    if not ranges:
+        return []
+    rs = sorted([list(r) for r in ranges])
+    merged = [rs[0]]
+    for s, e in rs[1:]:
+        if s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return merged
+
+
+def _ranges_len(ranges):
+    return sum(e - s for s, e in ranges)
+
+
 def _narrative_truncate(text):
-    """If the source overflows the single-pass char limit, keep the start +
-    a chunk near each likely-key section.
+    """If the source overflows the single-pass char limit, keep the start chunk
+    plus windows around key sections — but allocate the budget to the high-value
+    QUANTUM/CLAIMANT-PROFILE keywords BEFORE generic structural headings, and
+    deduplicate overlapping windows by RANGE rather than exact text (ISSUE-017).
 
-    The keyword list deliberately includes the QUANTUM / CLAIMANT-PROFILE
-    section terms (non-economic loss, future economic loss, PIAWE, weekly,
-    impairment/WPI, damages, buffer, date of birth, aged, occupation). These
-    are where the eight high-value target fields live, and in long decisions
-    they sit near the END — so they must survive truncation. We also anchor on
-    BOTH the first and last occurrence of each keyword because the operative
-    quantum assessment is usually the later mention."""
-    if len(text) <= SINGLE_PASS_LIMIT_CHARS:
+    Without this, a long decision with many early Background/Facts/Reasons hits
+    could fill the cap before the late non-economic-loss / WPI / PIAWE / date-of-
+    birth sections survive, producing false empty fields. Windows are anchored on
+    both the first and last occurrence of each keyword (the operative quantum
+    assessment is usually the later mention)."""
+    cap = SINGLE_PASS_LIMIT_CHARS
+    if len(text) <= cap:
         return text
-    keywords = (
-        # Structure
-        "Background", "Facts", "History",
-        "Particulars", "Mechanism", "Medical evidence",
-        "Pre-existing", "Treatment", "Diagnosis", "Surgery",
-        "Expert evidence", "Submissions", "Reasoning", "Findings",
-        "Reasons", "Discussion", "Issues", "Orders", "Conclusion", "Decision",
-        # Quantum / damages heads (where the 8 target fields live)
-        "non-economic loss", "non economic loss", "general damages",
-        "pain and suffering", "future economic loss", "loss of earning",
-        "earning capacity", "buffer", "quantum", "damages assessment",
-        "whole person impairment", "impairment", "WPI",
-        # Claimant profile / income
-        "PIAWE", "weekly", "per week", "pre-injury", "salary", "wage",
-        "date of birth", "born", "aged", "occupation", "employed",
-    )
     lowered = text.lower()
-    segments = [text[:30000]]
-    seen = {text[:30000]}
+    n = len(text)
 
-    def add_window(idx):
-        start = max(0, idx - 3000)
-        end = min(len(text), idx + 10000)
-        seg = text[start:end].strip()
-        if seg and seg not in seen:
-            seen.add(seg)
-            segments.append(seg)
+    def windows_for(kw):
+        out = []
+        first = lowered.find(kw)
+        if first != -1:
+            out.append((max(0, first - _TRUNCATE_BEFORE), min(n, first + _TRUNCATE_AFTER)))
+            last = lowered.rfind(kw)
+            if last != -1 and abs(last - first) > 8000:
+                out.append((max(0, last - _TRUNCATE_BEFORE), min(n, last + _TRUNCATE_AFTER)))
+        return out
 
-    for kw in keywords:
-        kwl = kw.lower()
-        first = lowered.find(kwl)
-        if first == -1:
+    # Priority order: start chunk, then TARGET keyword windows, then STRUCTURE.
+    candidates = [(0, min(30000, cap))]
+    for kw in _TRUNCATE_TARGET_KEYWORDS:
+        candidates.extend(windows_for(kw))
+    for kw in _TRUNCATE_STRUCTURE_KEYWORDS:
+        candidates.extend(windows_for(kw))
+
+    # Greedily accept windows in priority order, merging by range, never letting
+    # the kept content exceed the cap. Earlier (higher-priority) windows win the
+    # budget. When a window doesn't fully fit, TRIM it to the remaining budget
+    # (keeping its front, which holds the keyword at offset _TRUNCATE_BEFORE)
+    # rather than dropping it wholesale.
+    accepted = []
+    total = 0
+    for s, e in candidates:
+        remaining = cap - total
+        if remaining <= 0:
+            break
+        e = min(e, s + remaining)
+        if e <= s:
             continue
-        add_window(first)
-        last = lowered.rfind(kwl)
-        if last != -1 and abs(last - first) > 8000:
-            add_window(last)
-
-    combined = "\n\n...[SECTION BREAK]...\n\n".join(segments)
-    if len(combined) > SINGLE_PASS_LIMIT_CHARS:
-        combined = combined[:SINGLE_PASS_LIMIT_CHARS]
-    return combined
+        trial = _merge_ranges(accepted + [[s, e]])
+        tlen = _ranges_len(trial)
+        if tlen <= cap:
+            accepted, total = trial, tlen
+    accepted.sort()
+    return "\n\n...[SECTION BREAK]...\n\n".join(text[s:e].strip() for s, e in accepted)
 
 
 # ----------------------------------------------------------------------
@@ -1905,8 +2209,11 @@ the fields it flagged as missing.
 
 
 class LLMExtractor:
-    def __init__(self, api_key):
-        self.client = OpenAI(api_key=api_key)
+    def __init__(self, api_key, timeout=OPENAI_TIMEOUT):
+        # Explicit per-request timeout so a stalled call fails on a bounded
+        # deadline instead of pinning a worker thread (ISSUE-016). max_retries=0
+        # because _parse_with_retry owns the retry/backoff policy.
+        self.client = OpenAI(api_key=api_key, timeout=timeout, max_retries=0)
 
     def extract_text_from_html(self, html_content):
         return extract_html_with_paragraph_numbers(html_content)
@@ -1955,17 +2262,21 @@ class LLMExtractor:
                 return completion.choices[0].message.parsed, completion.usage, None
             except Exception as e:
                 last_error = e
-                if _is_quota_error(str(e)) and attempt < len(backoff_schedule):
+                ctx = f" ({context})" if context else ""
+                retryable = _is_quota_error(str(e)) or _is_transient_api_error(e)
+                if retryable and attempt < len(backoff_schedule):
                     delay = backoff_schedule[attempt]
-                    ctx = f" ({context})" if context else ""
+                    kind = "insufficient_quota" if _is_quota_error(str(e)) else "timeout/connection"
                     logging.warning(
-                        f"insufficient_quota{ctx} - retry {attempt+1}/{len(backoff_schedule)} in {delay}s "
-                        f"(treating as transient auto-recharge window)"
+                        f"{kind}{ctx} - retry {attempt+1}/{len(backoff_schedule)} in {delay}s: {e}"
                     )
                     time.sleep(delay)
                     continue
-                ctx = f" ({context})" if context else ""
-                logging.error(f"LLM parse error{ctx}: {e}")
+                # Distinguish timeout/connection failures from schema/parse errors.
+                if _is_transient_api_error(e):
+                    logging.error(f"LLM timeout/connection error{ctx} after retries: {e}")
+                else:
+                    logging.error(f"LLM parse error{ctx}: {e}")
                 return None, None, str(e)
         return None, None, str(last_error)
 
@@ -2047,41 +2358,48 @@ class DecisionScraper:
     def _is_current_schema(self, row):
         return isinstance(row, dict) and row.get("_schema_version") == SCHEMA_VERSION
 
+    def _backup_corrupt_cache(self, reason):
+        """Move an unusable cache aside to a TIMESTAMPED path so prior corrupt
+        input is preserved for diagnosis and repeated events don't clobber each
+        other. Tolerant of OSError so recovery still proceeds (ISSUE-008)."""
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup = f"{self.cache_file}.corrupted.{stamp}"
+        try:
+            shutil.move(self.cache_file, backup)
+            logging.error(f"Cache {self.cache_file} unusable ({reason}); moved to {backup}; starting empty.")
+        except OSError as e:
+            logging.error(f"Cache {self.cache_file} unusable ({reason}) and backup failed ({e}); "
+                          f"starting empty without moving the file.")
+
     def _load_cache(self):
-        """Loads cache safely. If corrupted, backs up and starts empty."""
-        if os.path.exists(self.cache_file):
-            try:
-                with open(self.cache_file, 'r') as f:
-                    loaded_cache = json.load(f)
-                if isinstance(loaded_cache, dict):
-                    return {
-                        url: annotate_analysis_fields(data) if isinstance(data, dict) else data
-                        for url, data in loaded_cache.items()
-                    }
-                logging.error(f"Cache file {self.cache_file} does not contain a dictionary. Starting with empty cache.")
-                return {}
-            except json.JSONDecodeError:
-                logging.error(f"Cache file {self.cache_file} is corrupted. Starting with empty cache.")
-                shutil.move(self.cache_file, self.cache_file + ".corrupted")
-                return {}
-        return {}
+        """Loads cache safely. If corrupted or not a dict, backs up (timestamped)
+        and starts empty. Never raises on a bad cache file (ISSUE-008)."""
+        if not os.path.exists(self.cache_file):
+            return {}
+        try:
+            with open(self.cache_file, "r", encoding="utf-8") as f:
+                loaded_cache = json.load(f)
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+            self._backup_corrupt_cache(f"read/parse error: {e}")
+            return {}
+        if not isinstance(loaded_cache, dict):
+            self._backup_corrupt_cache("top-level JSON is not an object")
+            return {}
+        return {
+            url: annotate_analysis_fields(data) if isinstance(data, dict) else data
+            for url, data in loaded_cache.items()
+        }
 
     def _save_cache(self, max_retries=3):
-        """
-        Thread-safe atomic write.
-        Copies cache under lock, dumps to temp file, then renames.
-        """
-        temp_file = self.cache_file + ".tmp"
-        
-        # Create a thread-safe snapshot of the data
+        """Atomic cache write via a per-process temp file (ISSUE-003). Callers
+        that also write the sidecar/reports should hold `dataset_lock()` around
+        the whole batch; this method does NOT self-lock (the lock is not
+        reentrant)."""
         with self.cache_lock:
             cache_copy = self.cache.copy()
-
         for attempt in range(1, max_retries + 1):
             try:
-                with open(temp_file, 'w') as f:
-                    json.dump(cache_copy, f, indent=2, default=str)
-                os.replace(temp_file, self.cache_file)
+                atomic_write_json(self.cache_file, cache_copy)
                 return True
             except Exception as e:
                 logging.error(f"Failed to save cache (attempt {attempt}/{max_retries}): {e}")
@@ -2123,13 +2441,12 @@ class DecisionScraper:
                     "provenance": row.get("_provenance", {}),
                     "field_review": row.get("_field_review", {}),
                 }
-                sidecar[url] = entry
+                # Privacy transforms apply to the OUTPUT sidecar only; the cache
+                # keeps full data (ISSUE-011). No-op unless a privacy knob is set.
+                sidecar[url] = apply_privacy_to_sidecar(entry)
 
-        temp_file = self.sidecar_file + ".tmp"
         try:
-            with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(sidecar, f, indent=2, default=str, ensure_ascii=False)
-            os.replace(temp_file, self.sidecar_file)
+            atomic_write_json(self.sidecar_file, sidecar, ensure_ascii=False)
             logging.info(f"Sidecar JSON saved to {self.sidecar_file} ({len(sidecar)} entries)")
             return True
         except Exception as e:
@@ -2241,6 +2558,12 @@ class DecisionScraper:
             cached = self.cache.get(url)
             if self._is_current_schema(cached):
                 return cached
+
+        # If the quota breaker has already tripped, skip BEFORE any network/file
+        # work — no further LLM extraction can succeed, so don't burn I/O on it
+        # (ISSUE-013).
+        if self.quota_breaker.is_aborted():
+            return None
 
         # Predict the local filename from URL+title so we can skip the network
         # entirely when we already have the file on disk.
@@ -2480,8 +2803,12 @@ class DecisionScraper:
             "Claimant Outcome": parsed.claimant_outcome.value,
             "Impairment %": wpi_strict,
             "Impairment % (Accepted)": wpi_accepted,
-            "Lump Sum": (parsed.lump_sum_amount or "").replace("$", "").replace(",", "").strip(),
-            "Weekly Benefit": parsed.weekly_benefit_amount,
+            # Coerce to a clean numeric string like the other money fields, so
+            # text such as "$300,000 inclusive of costs" / "Weekly $522.84
+            # ongoing" doesn't survive as non-numeric and get dropped by numeric
+            # filters downstream (ISSUE-006).
+            "Lump Sum": coerce_money(parsed.lump_sum_amount),
+            "Weekly Benefit": coerce_money(parsed.weekly_benefit_amount),
             "Non-Economic Loss": nel_amount,
             "Non-Economic Loss Status": nel_status,
             "Future Economic Loss": fel_amount,
@@ -2566,6 +2893,100 @@ class DecisionScraper:
         # Re-annotate so the Needs Review flag feeds the analysis-ready gate.
         return annotate_analysis_fields(result)
 
+def _report_sort_key(row):
+    decision_date = (row.get("Decision Date") or "").strip()
+    return decision_date if has_valid_iso_date(decision_date) else "0000-00-00"
+
+
+def generate_reports(scraper, detailed_path, analysis_ready_path, *, script,
+                     current_run_urls=None, manifest_extra=None):
+    """Regenerate the CSV reports + run manifest from the cache as ONE step
+    (ISSUE-001/002/015/022).
+
+    - Only current-schema rows flow into reports; stale-schema rows are excluded
+      and counted.
+    - CSVs are ALWAYS written (header-only when empty) via atomic per-process
+      temp files; never leave a previous run's CSV in place.
+    - Privacy transforms (ISSUE-011) apply to OUTPUT rows only.
+    - A manifest records schema version, timestamp, and counts so consumers can
+      detect stale/empty output.
+    Returns (all_data, analysis_ready_data) of the CURRENT-schema rows written.
+    """
+    with scraper.cache_lock:
+        snapshot = [(u, annotate_analysis_fields(r)) for u, r in scraper.cache.items()
+                    if isinstance(r, dict)]
+    total_cache = len(snapshot)
+    current = [(u, r) for u, r in snapshot if r.get("_schema_version") == SCHEMA_VERSION]
+    stale = total_cache - len(current)
+    unseen = 0
+    if current_run_urls is not None:
+        crs = set(current_run_urls)
+        unseen = sum(1 for u, _ in current if u not in crs)
+
+    all_data = [r for _, r in current]
+    all_data.sort(key=_report_sort_key, reverse=True)
+    analysis_ready = [r for r in all_data if r.get("Analysis Ready") == "Yes"]
+
+    out_all = [apply_privacy_to_row(r) for r in all_data]
+    out_ready = [apply_privacy_to_row(r) for r in analysis_ready]
+    atomic_write_csv(detailed_path, RESULT_FIELDS, out_all)
+    atomic_write_csv(analysis_ready_path, RESULT_FIELDS, out_ready)
+
+    if not all_data:
+        logging.warning(f"{detailed_path}: 0 current-schema rows — wrote header-only CSV.")
+    else:
+        logging.info(f"Summary report saved to {detailed_path} ({len(all_data)} rows).")
+    if not analysis_ready:
+        logging.warning(f"{analysis_ready_path}: 0 analysis-ready rows — wrote header-only CSV.")
+    else:
+        logging.info(f"Analysis-ready report saved to {analysis_ready_path} ({len(analysis_ready)} rows).")
+    if stale:
+        logging.warning(f"Excluded {stale} non-current-schema (v!={SCHEMA_VERSION}) cache rows from reports.")
+    if current_run_urls is not None and unseen:
+        logging.info(f"{unseen} current-schema cache rows were not seen in this run's index scan "
+                     f"(retained in cache and reports).")
+
+    needs_review = sum(1 for r in all_data if str(r.get("Needs Review", "")).strip() == "Yes")
+    extra = {"stale_rows_excluded": stale, "cache_rows_not_in_current_run": unseen,
+             "total_cache_rows": total_cache}
+    if manifest_extra:
+        extra.update(manifest_extra)
+    write_run_manifest(script=script, total_rows=len(all_data),
+                       analysis_ready_rows=len(analysis_ready),
+                       needs_review_rows=needs_review, **extra)
+    return all_data, analysis_ready
+
+
+def regenerate_reports_from_cache(cache, detailed_path, analysis_ready_path, *, script,
+                                  **manifest_extra):
+    """Report regeneration for the maintenance scripts, which hold a raw cache
+    dict rather than a DecisionScraper. Same guarantees as generate_reports:
+    current-schema rows only, always-write (header-only when empty), atomic,
+    privacy-applied outputs, run manifest (ISSUE-001/002/015/022). Callers
+    should wrap this in `dataset_lock()`."""
+    rows = [annotate_analysis_fields(r) for r in cache.values() if isinstance(r, dict)]
+    total_cache = len(rows)
+    current = [r for r in rows if r.get("_schema_version") == SCHEMA_VERSION]
+    stale = total_cache - len(current)
+    current.sort(key=_report_sort_key, reverse=True)
+    analysis_ready = [r for r in current if r.get("Analysis Ready") == "Yes"]
+
+    atomic_write_csv(detailed_path, RESULT_FIELDS, [apply_privacy_to_row(r) for r in current])
+    atomic_write_csv(analysis_ready_path, RESULT_FIELDS, [apply_privacy_to_row(r) for r in analysis_ready])
+    logging.info(f"Rewrote {detailed_path} ({len(current)} rows) and "
+                 f"{analysis_ready_path} ({len(analysis_ready)} rows).")
+    if not current:
+        logging.warning(f"{detailed_path}: 0 current-schema rows — wrote header-only CSV.")
+    if stale:
+        logging.warning(f"Excluded {stale} non-current-schema (v!={SCHEMA_VERSION}) cache rows from reports.")
+    needs_review = sum(1 for r in current if str(r.get("Needs Review", "")).strip() == "Yes")
+    write_run_manifest(script=script, total_rows=len(current),
+                       analysis_ready_rows=len(analysis_ready),
+                       needs_review_rows=needs_review,
+                       stale_rows_excluded=stale, total_cache_rows=total_cache, **manifest_extra)
+    return current, analysis_ready
+
+
 def main():
     load_dotenv()
     api_key = os.getenv("OPENAI_API_KEY")
@@ -2577,9 +2998,12 @@ def main():
     OUTPUT_DIR = "nsw_pic_decisions"
     CSV_REPORT = "detailed_payout_summary.csv"
     ANALYSIS_READY_REPORT = "analysis_ready_payout_summary.csv"
+    if privacy_active():
+        logging.info(f"Privacy mode active for OUTPUTS: {privacy_summary()} "
+                     f"(cache retains full data). Decision text is sent to the OpenAI API.")
     scraper = DecisionScraper(BASE_DOMAIN, OUTPUT_DIR, api_key)
     index_delay_seconds = float(os.getenv("AUSTLII_INDEX_DELAY", "2"))
-    
+
     years = list(range(2021, datetime.datetime.now().year + 1))
     all_links = []
 
@@ -2593,86 +3017,91 @@ def main():
     logging.info(f"Total decisions found (2021-Present): {len(all_links)}")
 
     target_links = all_links
-    max_workers = int(os.getenv("EXTRACTION_WORKERS", str(DEFAULT_WORKERS)))
+    current_run_urls = {url for _, url in target_links}
+    max_workers = get_worker_count()  # validated/clamped (ISSUE-018)
 
     logging.info(f"Starting parallel processing of {len(target_links)} decisions ({max_workers} threads)...")
     results = []
     wall_t0 = time.monotonic()
 
+    # Bounded submission: keep ~window tasks in flight rather than enqueueing the
+    # whole corpus, and cancel queued work the moment the quota breaker trips
+    # (ISSUE-013).
+    window = max(max_workers * 4, max_workers)
+    total = len(target_links)
+    done = 0
+    aborted_logged = False
+    it = iter(target_links)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_url = {
-            executor.submit(scraper.process_decision, title, url): url
-            for title, url in target_links
-        }
+        in_flight = set()
+        for _ in range(window):
+            nxt = next(it, None)
+            if nxt is None:
+                break
+            in_flight.add(executor.submit(scraper.process_decision, *nxt))
 
-        for i, future in enumerate(as_completed(future_to_url)):
-            url = future_to_url[future]
-            try:
-                data = future.result()
-                if data:
-                    results.append(data)
-            except Exception as e:
-                logging.error(f"Unhandled exception while processing {url}: {e}")
+        while in_flight:
+            finished, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+            for fut in finished:
+                done += 1
+                try:
+                    data = fut.result()
+                    if data:
+                        results.append(data)
+                except Exception as e:
+                    logging.error(f"Unhandled exception while processing a decision: {e}")
+                if done % 25 == 0:
+                    with dataset_lock():
+                        scraper._save_cache()
+                    logging.info(
+                        f"Progress: {done}/{total} processed, "
+                        f"running cost ${scraper.cost_tracker.total_cost():.2f} "
+                        f"({scraper.cost_tracker.calls} LLM calls)"
+                    )
 
-            # Periodic save every 25 completions.
-            if i > 0 and i % 25 == 0:
-                scraper._save_cache()
-                logging.info(
-                    f"Progress: {i+1}/{len(target_links)} processed, "
-                    f"running cost ${scraper.cost_tracker.total_cost():.2f} "
-                    f"({scraper.cost_tracker.calls} LLM calls)"
-                )
+            if scraper.quota_breaker.is_aborted():
+                if not aborted_logged:
+                    aborted_logged = True
+                    logging.error(
+                        f"QUOTA BREAKER TRIPPED at {done}/{total} — cancelling queued work and "
+                        f"halting submission. Top up the OpenAI account and re-run; cached rows "
+                        f"are preserved.")
+                for f in in_flight:
+                    f.cancel()
+                in_flight = set()
+                break
 
-    scraper._save_cache()
-    scraper._save_sidecar()
-    wall_elapsed = time.monotonic() - wall_t0
+            # Refill the window (only if not aborted).
+            for _ in range(len(finished)):
+                nxt = next(it, None)
+                if nxt is None:
+                    break
+                in_flight.add(executor.submit(scraper.process_decision, *nxt))
 
-    # Cost summary
-    ct = scraper.cost_tracker
-    logging.info("=" * 70)
-    logging.info("LLM USAGE / COST")
-    logging.info("=" * 70)
-    logging.info(f"  Wall-clock:        {wall_elapsed:.1f}s")
-    logging.info(f"  LLM calls:         {ct.calls}")
-    logging.info(f"  Prompt tokens:     {ct.prompt_tokens:,}  (cached {ct.cached_tokens:,})")
-    logging.info(f"  Completion tokens: {ct.completion_tokens:,}  (reasoning {ct.reasoning_tokens:,})")
-    logging.info(f"  Total cost:        ${ct.total_cost():.2f}")
-    if ct.calls:
-        logging.info(f"  Mean per call:     ${ct.total_cost() / ct.calls:.4f}")
+    with dataset_lock():
+        scraper._save_cache()
+        scraper._save_sidecar()
+        wall_elapsed = time.monotonic() - wall_t0
 
-    # Use thread-safe snapshot for final report generation
-    with scraper.cache_lock:
-        all_data = [annotate_analysis_fields(row) for row in scraper.cache.values()]
+        # Cost summary
+        ct = scraper.cost_tracker
+        logging.info("=" * 70)
+        logging.info("LLM USAGE / COST")
+        logging.info("=" * 70)
+        logging.info(f"  Wall-clock:        {wall_elapsed:.1f}s")
+        logging.info(f"  LLM calls:         {ct.calls}")
+        logging.info(f"  Prompt tokens:     {ct.prompt_tokens:,}  (cached {ct.cached_tokens:,})")
+        logging.info(f"  Completion tokens: {ct.completion_tokens:,}  (reasoning {ct.reasoning_tokens:,})")
+        logging.info(f"  Total cost:        ${ct.total_cost():.2f}")
+        if ct.calls:
+            logging.info(f"  Mean per call:     ${ct.total_cost() / ct.calls:.4f}")
 
-    analysis_ready_data = [
-        row for row in all_data
-        if row.get("Analysis Ready") == "Yes"
-    ]
-
-    def _decision_date_sort_key(row):
-        decision_date = (row.get("Decision Date") or "").strip()
-        if has_valid_iso_date(decision_date):
-            return decision_date
-        return "0000-00-00"
-
-    all_data.sort(key=_decision_date_sort_key, reverse=True)
-    analysis_ready_data.sort(key=_decision_date_sort_key, reverse=True)
-    
-    if all_data:
-        with open(CSV_REPORT, 'w', newline='', encoding='utf-8') as output_file:
-            dict_writer = csv.DictWriter(output_file, fieldnames=RESULT_FIELDS, extrasaction='ignore')
-            dict_writer.writeheader()
-            dict_writer.writerows(all_data)
-        logging.info(f"Summary report saved to {CSV_REPORT}")
-
-    if analysis_ready_data:
-        with open(ANALYSIS_READY_REPORT, 'w', newline='', encoding='utf-8') as output_file:
-            dict_writer = csv.DictWriter(output_file, fieldnames=RESULT_FIELDS, extrasaction='ignore')
-            dict_writer.writeheader()
-            dict_writer.writerows(analysis_ready_data)
-        logging.info(f"Analysis-ready report saved to {ANALYSIS_READY_REPORT}")
-    else:
-        logging.warning("No analysis-ready rows were produced.")
+        all_data, analysis_ready_data = generate_reports(
+            scraper, CSV_REPORT, ANALYSIS_READY_REPORT,
+            script="nsw_court_scraper.main", current_run_urls=current_run_urls,
+            manifest_extra={"quota_aborted": bool(aborted_logged),
+                            "index_links": total, "llm_calls": ct.calls},
+        )
 
     print_summary(all_data, analysis_ready_data)
 
@@ -2719,8 +3148,9 @@ def print_summary(all_data, analysis_ready_data):
         return
 
     lump_sum_counts = defaultdict(int)
-    impairment_counts = defaultdict(int)
-    both_counts = defaultdict(int)
+    impairment_counts = defaultdict(int)       # strict "made-here" WPI
+    accepted_counts = defaultdict(int)         # accepted/relied-on WPI (analysis-useful)
+    both_counts = defaultdict(int)             # lump sum AND accepted WPI
     injury_dates = defaultdict(list)
     decision_dates = defaultdict(list)
 
@@ -2741,12 +3171,18 @@ def print_summary(all_data, analysis_ready_data):
         case_type = row.get("Case Type") or "Unknown"
         has_lump = _has_numeric_value(row.get("Lump Sum", ""))
         has_impairment = _has_numeric_value(row.get("Impairment %", ""))
+        # Accepted WPI is the analysis-useful field for CTP payout-vs-WPI work;
+        # after the v3 split many valid CTP rows have blank strict Impairment %
+        # but a populated accepted WPI, so count both (ISSUE-009).
+        has_accepted = _has_numeric_value(row.get("Impairment % (Accepted)", ""))
 
         if has_lump:
             lump_sum_counts[case_type] += 1
         if has_impairment:
             impairment_counts[case_type] += 1
-        if has_lump and has_impairment:
+        if has_accepted:
+            accepted_counts[case_type] += 1
+        if has_lump and has_accepted:
             both_counts[case_type] += 1
 
         inj = row.get("Injury Date", "").strip()
@@ -2758,8 +3194,8 @@ def print_summary(all_data, analysis_ready_data):
             decision_dates[case_type].append(dec)
 
     case_types = sorted(set(
-        list(lump_sum_counts) + list(impairment_counts) + list(both_counts)
-        + list(injury_dates) + list(decision_dates)
+        list(lump_sum_counts) + list(impairment_counts) + list(accepted_counts)
+        + list(both_counts) + list(injury_dates) + list(decision_dates)
     ))
 
     print("\n" + "=" * 70)
@@ -2769,8 +3205,9 @@ def print_summary(all_data, analysis_ready_data):
     for ct in case_types:
         print(f"\n--- {ct} ---")
         print(f"  Rows with Lump Sum:              {lump_sum_counts.get(ct, 0)}")
-        print(f"  Rows with Impairment %:          {impairment_counts.get(ct, 0)}")
-        print(f"  Rows with both:                  {both_counts.get(ct, 0)}")
+        print(f"  Rows with Impairment % (strict): {impairment_counts.get(ct, 0)}")
+        print(f"  Rows with WPI (Accepted):        {accepted_counts.get(ct, 0)}")
+        print(f"  Rows with Lump Sum + Accepted:   {both_counts.get(ct, 0)}")
 
         inj = injury_dates.get(ct, [])
         if inj:
