@@ -498,18 +498,20 @@ def test_regenerate_reports_always_writes_and_filters_schema():
         cache["u3"] = stale
 
         det, rdy = "d.csv", "r.csv"
-        all_data, ready = ns.regenerate_reports_from_cache(cache, det, rdy, script="test")
+        manifest = "m.json"
+        all_data, ready = ns.regenerate_reports_from_cache(
+            cache, det, rdy, script="test", path=manifest)
         assert os.path.exists(det) and os.path.exists(rdy)
         urls = {r["URL"] for r in all_data}
         assert urls == {"u1", "u2"}          # stale u3 excluded
         assert {r["URL"] for r in ready} == {"u1"}  # only the analysis-ready one
         # manifest written with counts
-        man = json.load(open("run_manifest.json", encoding="utf-8"))
+        man = json.load(open(manifest, encoding="utf-8"))
         assert man["total_rows"] == 2 and man["analysis_ready_rows"] == 1
         assert man["stale_rows_excluded"] == 1
 
         # Empty cache -> header-only CSVs (ISSUE-001), no crash
-        ns.regenerate_reports_from_cache({}, det, rdy, script="test")
+        ns.regenerate_reports_from_cache({}, det, rdy, script="test", path=manifest)
         with open(rdy, encoding="utf-8") as f:
             rows = list(csv.reader(f))
         assert len(rows) == 1 and rows[0][0] == "Case Name"  # header only
@@ -517,18 +519,27 @@ def test_regenerate_reports_always_writes_and_filters_schema():
         os.chdir(cwd)
 
 
-def test_ctp_excel_requires_accepted_wpi():
+def test_ctp_excel_requires_a_lump_sum_not_a_wpi():
+    """Population rule: a positive lump sum. The earlier rule also demanded a
+    positive accepted WPI (ISSUE-005), which dropped ~250 real awards whose
+    decision simply never states one. Those rows are now kept with a blank
+    WPI and `WPI % Provenance = absent`, so the absence is modellable instead
+    of invisible. See test_workbook_population_requires_lump_sum_only in
+    test_damages_extraction.py for the provenance detail."""
     import pandas as pd
     import ctp_lump_sum_impairment as ctp
     df = pd.DataFrame([
         {"URL": "a", "Case Type": "CTP", "Analysis Ready": "Yes",
          "Lump Sum": "200000", "Impairment % (Accepted)": "14"},   # kept
         {"URL": "b", "Case Type": "CTP", "Analysis Ready": "Yes",
-         "Lump Sum": "150000", "Impairment % (Accepted)": ""},     # dropped: no WPI
+         "Lump Sum": "150000", "Impairment % (Accepted)": ""},     # kept: no WPI stated
+        {"URL": "c", "Case Type": "CTP", "Analysis Ready": "Yes",
+         "Lump Sum": "", "Impairment % (Accepted)": "14"},         # dropped: no award
     ])
     out, _ = ctp.build_workbook(df, {})
-    assert list(out["URL"]) == ["a"]          # row b excluded (ISSUE-005)
+    assert sorted(out["URL"]) == ["a", "b"]
     assert "WPI %" in out.columns and "Impairment % (Accepted)" not in out.columns
+    assert list(out["WPI % Provenance"]) == ["stated", "absent"]
 
 
 # ----------------------------------------------------------------------

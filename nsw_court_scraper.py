@@ -23,15 +23,97 @@ from threading import Lock
 from collections import defaultdict
 import hashlib
 
+# Damages-breakdown pass (downstream spec 2026-07-27). Lives in its own module
+# and imports nothing from here, so the dependency runs one way only.
+from wpi_resolution import (
+    WPI_FIELDS,
+    to_pct as to_float_pct,
+    WPI_RESOLUTION_ENABLED,
+    WPI_RESOLUTION_REASONING_EFFORT,
+    WPI_SYSTEM_INSTRUCTION,
+    WpiResolution,
+    empty_wpi_row,
+    resolve_wpi,
+)
+from damages_extraction import (
+    DAMAGES_CASE_TYPES,
+    DAMAGES_FIELDS,
+    DAMAGES_PASS_ENABLED,
+    DAMAGES_REASONING_EFFORT,
+    DAMAGES_SYSTEM_INSTRUCTION,
+    DamagesSchema,
+    build_damages_context,
+    compose_description_with_figures,
+    damages_row_from_parsed,
+    empty_damages_row,
+)
+
+# ----------------------------------------------------------------------
+# Output layout
+# ----------------------------------------------------------------------
+#
+# Everything this pipeline GENERATES lives under one folder so the repo root
+# holds source only. Source inputs (the downloaded decisions) stay where they
+# are — they are scraped material, not output, and moving 6,000+ files buys
+# nothing. Override the location with NSW_OUTPUT_DIR.
+OUTPUT_ROOT = os.getenv("NSW_OUTPUT_DIR", "output")
+os.makedirs(OUTPUT_ROOT, exist_ok=True)
+
+DECISIONS_DIR = os.getenv("NSW_DECISIONS_DIR", "nsw_pic_decisions")
+
+CACHE_FILE = os.path.join(OUTPUT_ROOT, "processed_cache.json")
+SIDECAR_FILE = os.path.join(OUTPUT_ROOT, "processed_sidecar.json")
+CSV_REPORT = os.path.join(OUTPUT_ROOT, "detailed_payout_summary.csv")
+ANALYSIS_READY_REPORT = os.path.join(OUTPUT_ROOT, "analysis_ready_payout_summary.csv")
+WORKBOOK_FILE = os.path.join(OUTPUT_ROOT, "ctp_impairment_lump_sum.xlsx")
+LOG_FILE = os.path.join(OUTPUT_ROOT, "scraper.log")
+
+# Artifacts written before the output folder existed. Moved on import rather
+# than left behind: the cache represents thousands of dollars of extraction, and
+# silently starting from an empty one because the path moved would be the worst
+# possible failure mode. Runs BEFORE logging is configured, because the log file
+# is one of the things being moved.
+_LEGACY_OUTPUT_FILES = (
+    "processed_cache.json", "processed_sidecar.json",
+    "detailed_payout_summary.csv", "analysis_ready_payout_summary.csv",
+    "ctp_impairment_lump_sum.xlsx", "run_manifest.json",
+    "austlii_data_errors.json", "scraper.log",
+)
+
+
+def migrate_legacy_outputs(root=OUTPUT_ROOT, names=_LEGACY_OUTPUT_FILES):
+    """Move pre-`output/` artifacts from the working directory into `root`.
+
+    Never overwrites: if the file already exists in `root` the legacy copy is
+    left alone for the operator to reconcile. Returns the list moved.
+    """
+    moved = []
+    for name in names:
+        dest = os.path.join(root, name)
+        if os.path.exists(name) and not os.path.exists(dest):
+            try:
+                shutil.move(name, dest)
+                moved.append(name)
+            except OSError as e:  # pragma: no cover - filesystem dependent
+                print(f"WARNING: could not move {name} to {dest}: {e}")
+    return moved
+
+
+_MIGRATED_OUTPUTS = migrate_legacy_outputs()
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("scraper.log"),
+        logging.FileHandler(LOG_FILE),
         logging.StreamHandler()
     ]
 )
+
+if _MIGRATED_OUTPUTS:
+    logging.info(f"Moved {len(_MIGRATED_OUTPUTS)} legacy output file(s) into "
+                 f"{OUTPUT_ROOT}/: {', '.join(_MIGRATED_OUTPUTS)}")
 
 ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -76,7 +158,7 @@ RESULT_FIELDS = [
     "Status", "LLM Error",
     "Needs Review", "Review Notes",
     "Analysis Ready", "Analysis Exclusion Reason",
-]
+] + list(WPI_FIELDS) + list(DAMAGES_FIELDS)
 
 # The eight high-value target fields the extraction must capture reliably.
 # Used by the field-loss gate, the focused second pass, and coverage metrics.
@@ -102,7 +184,23 @@ SIDECAR_KEYS = (
     "_banding_validation",   # banded_case_description validation result
     "_provenance",           # per-field verbatim source quotes (A2)
     "_field_review",         # field-loss gate issues + second-pass record (A1/A6)
+    "_damages",              # damages-pass quotes/issues/derivation detail
+    "_wpi_resolution",       # classified WPI mentions + resolution ladder detail
+    "_wpi_version",          # WPI-resolution pass version
+    "_wpi_pre_value",        # WPI before the resolution pass first ran
+    "_damages_version",      # damages-pass schema version (see DAMAGES_VERSION)
 )
+
+# Version of the damages-breakdown pass. Bumped independently of
+# SCHEMA_VERSION so adding/changing damages fields does NOT invalidate every
+# cached row (and so does not empty the reports, which only carry
+# current-SCHEMA_VERSION rows). backfill_damages_breakdown.py targets rows whose
+# _damages_version is below this.
+DAMAGES_VERSION = 1
+
+# Version of the WPI-resolution pass (see wpi_resolution.py). Independent of
+# SCHEMA_VERSION for the same reason as DAMAGES_VERSION.
+WPI_VERSION = 1
 
 MODEL = "gpt-5"
 REASONING_EFFORT = "low"
@@ -133,8 +231,8 @@ OPENAI_TIMEOUT = float(os.getenv("NSW_OPENAI_TIMEOUT", "120"))
 MAX_WORKERS = int(os.getenv("NSW_MAX_WORKERS", "64"))
 
 # Operational artifacts.
-RUN_MANIFEST_FILE = os.getenv("NSW_RUN_MANIFEST", "run_manifest.json")
-DATASET_LOCK_PATH = os.getenv("NSW_DATASET_LOCK", ".nsw_dataset.lock")
+RUN_MANIFEST_FILE = os.getenv("NSW_RUN_MANIFEST", os.path.join(OUTPUT_ROOT, "run_manifest.json"))
+DATASET_LOCK_PATH = os.getenv("NSW_DATASET_LOCK", os.path.join(OUTPUT_ROOT, ".nsw_dataset.lock"))
 
 
 # ----------------------------------------------------------------------
@@ -207,6 +305,11 @@ def apply_privacy_to_sidecar(entry):
     e = dict(entry)
     if PRIVACY_DROP_PROVENANCE:
         e["provenance"] = {}
+        # The damages pass stores verbatim source snippets too.
+        dmg = dict(e.get("damages") or {})
+        if "quotes" in dmg:
+            dmg["quotes"] = {}
+        e["damages"] = dmg
     if PRIVACY_DROP_DOB:
         fr = dict(e.get("field_review") or {})
         if "date_of_birth" in fr:
@@ -420,6 +523,19 @@ def annotate_analysis_fields(row):
     return annotated
 
 
+def ensure_damages_defaults(row):
+    """Fill the damages columns on a row extracted before the damages pass
+    existed. A blank in `Past Economic Loss` would read as a genuine zero; the
+    defaults say 'Not addressed' / 'absent' / 'not run' instead, which is what
+    is actually true of those rows."""
+    if row.get("Damages Extraction Status"):
+        return row
+    filled = empty_damages_row(status="not run")
+    filled.update(empty_wpi_row(row.get("Impairment % (Accepted)", "")))
+    filled.update({k: v for k, v in row.items() if v not in (None, "")})
+    return filled
+
+
 def build_result_record(title, url, file_saved="", status="", llm_error="", **overrides):
     row = {field: "" for field in RESULT_FIELDS}
     row.update({
@@ -439,6 +555,12 @@ def build_result_record(title, url, file_saved="", status="", llm_error="", **ov
     row["_token_usage"] = {}
     row["_provenance"] = {}
     row["_field_review"] = {}
+    row["_damages"] = {}
+    row["_damages_version"] = 0
+    # Damages columns default to the honest "we have not looked" state rather
+    # than blanks that read as genuine zeros.
+    row.update(empty_damages_row(status="not run"))
+    row.update(empty_wpi_row())
     row.update(overrides)
     return annotate_analysis_fields(row)
 
@@ -965,6 +1087,31 @@ def find_wpi_candidates(decision_text):
         for m in rgx.finditer(decision_text):
             v = float(m.group(1))
             if 0 <= v <= 100 and not _is_threshold_mention(decision_text, m.start(), m.end()):
+                values.add(v)
+    return values
+
+
+def find_wpi_tokens(decision_text):
+    """Every WPI-shaped percentage in the text, WITHOUT the threshold filter.
+
+    `find_wpi_candidates` suppresses anything sitting near threshold wording,
+    which is right for a regex that cannot read context but wrong as a GATE for
+    the resolution pass: a decision reading "...does not exceed the statutory
+    threshold of 10% whole person impairment. Dr X assessed 8% WPI" has every
+    token inside the suppression window, so the candidate set comes back empty
+    and the row is never examined at all — losing a real 8% finding, and every
+    genuine 0% recorded next to a minor-injury recital.
+
+    Use this to decide WHETHER to look; use find_wpi_candidates to decide what a
+    regex may safely conclude on its own.
+    """
+    if not decision_text:
+        return set()
+    values = set()
+    for rgx in (_WPI_FWD_RE, _WPI_REV_RE):
+        for m in rgx.finditer(decision_text):
+            v = float(m.group(1))
+            if 0 <= v <= 100:
                 values.add(v)
     return values
 
@@ -1689,6 +1836,172 @@ def merge_focused_into_record(result, focused, target_cols):
     return recovered
 
 
+def damages_pass_applies(record):
+    """Whether the damages breakdown pass should run for this row. Gated on
+    case type because the workbook the spec targets is CTP-only; widen with
+    NSW_DAMAGES_CASE_TYPES."""
+    if not DAMAGES_PASS_ENABLED:
+        return False
+    return str(record.get("Case Type", "") or "").strip() in DAMAGES_CASE_TYPES
+
+
+def merge_damages_into_record(record, parsed):
+    """Merge a parsed DamagesSchema into a flat record IN PLACE.
+
+    The consumer's load-bearing columns (`Lump Sum`, `Non-Economic Loss`,
+    `Future Economic Loss` and their statuses, `Description`) are never
+    overwritten — the pass's independent readings land in the `(Recheck)`
+    columns so extractor accuracy stays measurable. The previously-empty
+    `Weekly Benefit` is filled only when it is currently blank.
+
+    Returns the sidecar dict for `_damages`.
+    """
+    flat, sidecar, _issues = damages_row_from_parsed(
+        parsed, existing=record, description=record.get("Description", ""),
+    )
+    record.update(flat)
+
+    if not str(record.get("Weekly Benefit", "") or "").strip():
+        record["Weekly Benefit"] = flat.get("Weekly Statutory Benefit", "")
+
+    record["_damages_version"] = DAMAGES_VERSION
+    record["_damages"] = sidecar
+    return sidecar
+
+
+def wpi_is_legally_impossible(record):
+    """True when the row's own award contradicts its WPI.
+
+    s 4.11 of the Motor Accident Injuries Act 2017 permits damages for
+    non-economic loss ONLY where impairment exceeds 10%. A row with NEL
+    `Awarded` and a WPI at or below 10 is therefore wrong on its face —
+    usually because the captured figure is one component or one body system
+    rather than the governing total. These are the only populated rows the
+    resolution pass is allowed to correct.
+    """
+    if str(record.get("Non-Economic Loss Status") or "").strip() != "Awarded":
+        return False
+    current = to_float_pct(record.get("Impairment % (Accepted)"))
+    return current is not None and current <= 10
+
+
+def merge_wpi_resolution_into_record(record, parsed):
+    """Merge a parsed WpiResolution into a flat record IN PLACE.
+
+    Only fills `Impairment % (Accepted)` when the ladder produced a value; a
+    resolution that finds nothing must not blank a WPI the main pass already
+    captured. Returns the sidecar dict for `_wpi_resolution`.
+    """
+    existing = str(record.get("Impairment % (Accepted)") or "").strip()
+    # Remember what the main extraction had BEFORE this pass ever touched the
+    # row, so a re-run under a changed ladder can start from the same place
+    # instead of treating its own previous output as pre-existing truth.
+    if "_wpi_pre_value" not in record:
+        record["_wpi_pre_value"] = existing
+    resolved = resolve_wpi(parsed, existing=existing,
+                           nel_status=record.get("Non-Economic Loss Status", ""))
+    value = resolved.pop("Impairment % (Accepted)", "")
+    provenance = resolved.get("WPI Provenance", "absent")
+
+    if not existing:
+        # Nothing to lose: take whatever the ladder produced, at its own
+        # provenance. This is the "better than nothing" case.
+        record["Impairment % (Accepted)"] = value
+    elif wpi_is_legally_impossible(record) and value and to_float_pct(value) is not None             and to_float_pct(value) > 10:
+        # Narrow exception to fill-only: the existing figure is contradicted by
+        # the decision's own award of non-economic loss, and the ladder found a
+        # figure that is not.
+        logging.info(f"WPI {existing} -> {value} ({resolved.get('WPI Basis')}): "
+                     f"NEL awarded requires impairment above 10%")
+        record["Impairment % (Accepted)"] = value
+    else:
+        # FILL ONLY. This pass sees classified mentions; the main extraction
+        # read the whole decision including the Member's reasoning, and an
+        # audit of the corrections this pass proposed found a third of them
+        # wrong (an insurer's CONCESSION of 25% classified as a rejected claim;
+        # one doctor's 0% preferred over another's assessment). A resolution
+        # built for empty fields must not relitigate populated ones.
+        # NEVER displace a captured value with a derived or inferred estimate.
+        # A median of rival medico-legal reports is a fallback for an empty
+        # field, not an improvement on a figure already extracted.
+        if value and value != existing:
+            resolved["WPI Resolution Notes"] = (
+                f"ladder produced {value} ({provenance}); kept extracted {existing}. "
+                + (resolved.get("WPI Resolution Notes") or ""))[:300]
+        resolved["WPI Provenance"] = "stated"
+        resolved["WPI Basis"] = "retained from main extraction"
+    record.update(resolved)
+
+    # Row-level consistency: the threshold finding and the value must agree.
+    # s 4.11 makes non-economic loss available only ABOVE 10%, so a row saying
+    # "above 10%" while carrying 9.5% is self-contradictory on its face,
+    # whatever produced it. Flag rather than silently publish.
+    final = to_float_pct(record.get("Impairment % (Accepted)"))
+    threshold = record.get("WPI Threshold Finding", "")
+    if final is not None and (
+            (threshold == "above 10%" and final <= 10)
+            or (threshold == "not above 10%" and final > 10)):
+        note = (f"WPI {record['Impairment % (Accepted)']} contradicts threshold "
+                f"finding '{threshold}'")
+        logging.warning(f"{note} for {record.get('Case Name', '')[:50]}")
+        record["Review Notes"] = "; ".join(
+            x for x in [record.get("Review Notes", ""), note] if x)[:1000]
+
+    record["_wpi_version"] = WPI_VERSION
+    record["_wpi_resolution"] = {
+        "mentions": [
+            {
+                "value": m.value,
+                "kind": getattr(m.kind, "value", m.kind),
+                "body_system": getattr(m.body_system, "value", m.body_system),
+                "assessor": m.assessor,
+                "superseded": bool(m.superseded),
+                "about_claimant": bool(m.about_claimant),
+                "quote": (m.quote or "")[:160],
+            }
+            for m in (getattr(parsed, "mentions", None) or [])
+        ],
+        "tribunal_selected_value": getattr(parsed, "tribunal_selected_value", ""),
+        "tribunal_selected_quote": getattr(parsed, "tribunal_selected_quote", ""),
+        "settlement_approval_without_wpi": bool(
+            getattr(parsed, "settlement_approval_without_wpi", False)),
+        # Needed to replay the ladder offline without re-classifying.
+        "threshold_finding": getattr(
+            getattr(parsed, "threshold_finding", None), "value",
+            getattr(parsed, "threshold_finding", "")) or "not determined",
+        "totals_are_rival_assessments": bool(
+            getattr(parsed, "totals_are_rival_assessments", True)),
+        "components_share_one_assessment": bool(
+            getattr(parsed, "components_share_one_assessment", False)),
+        "basis": record.get("WPI Basis", ""),
+    }
+    return record["_wpi_resolution"]
+
+
+def wpi_resolution_applies(record, decision_text):
+    """Whether the WPI-resolution pass is worth a call: the field is empty (or
+    the source holds several figures the strict regex refused to choose
+    between) and there is at least one WPI-shaped token to reason about."""
+    if not WPI_RESOLUTION_ENABLED:
+        return False
+    # Gate on the RAW tokens, not the threshold-filtered candidates: a genuine
+    # figure that merely sits near threshold wording would otherwise never be
+    # looked at (see find_wpi_tokens).
+    tokens = find_wpi_tokens(decision_text)
+    if not tokens:
+        return False
+    current = str(record.get("Impairment % (Accepted)") or "").strip()
+    return (not current) or len(tokens) > 1 or wpi_is_legally_impossible(record)
+
+
+def normalise_medical_costs(value):
+    """`N/A` round-trips through pandas as NaN, which is why the consumer sees
+    `Medical Costs` as 0% populated (spec 4.1). Emit a sentinel that survives
+    CSV -> DataFrame -> Excel -> DataFrame instead."""
+    v = str(value or "").strip()
+    return "Not addressed" if v in ("", "N/A", "NA", "n/a") else v
+
+
 def worth_second_pass(losses, provenance):
     """Whether the focused second pass is worth its cost: fire for any
     high-severity loss (the five numeric/core fields) or a medium loss the
@@ -1847,7 +2160,7 @@ class QuotaCircuitBreaker:
 # Can't extract contents</article>). These are not scraper bugs; they need
 # manual review and potentially manual upload of the source from elsewhere.
 
-AUSTLII_ERROR_LOG = "austlii_data_errors.json"
+AUSTLII_ERROR_LOG = os.path.join(OUTPUT_ROOT, "austlii_data_errors.json")
 _austlii_error_lock = Lock()
 
 
@@ -2330,13 +2643,58 @@ class LLMExtractor:
             context=context, reasoning_effort=FOCUSED_REASONING_EFFORT,
         )
 
+    def extract_wpi_resolution(self, source_text, context=None):
+        """Classify every WPI figure in a decision so the caller can resolve
+        them (see wpi_resolution.py). Used when the source holds more than one
+        figure, where a regex cannot tell a component from a rival assessment
+        from a statutory-threshold recital."""
+        if not source_text:
+            return None, None, "empty source"
+        processed = _narrative_truncate(source_text)
+        user_content = (
+            "Classify every whole-person-impairment percentage in the decision "
+            "below. Do NOT do arithmetic; report the figures as you find them.\n\n"
+            "---\n"
+            f"{processed}\n"
+            "---\n"
+        )
+        return self._parse_with_retry(
+            WPI_SYSTEM_INSTRUCTION, user_content, WpiResolution,
+            context=context, reasoning_effort=WPI_RESOLUTION_REASONING_EFFORT,
+        )
+
+    def extract_damages(self, source_text, context=None):
+        """Damages-breakdown pass (downstream spec 2026-07-27).
+
+        A separate call rather than extra fields on CombinedSchema: the eight
+        high-value fields the consumer already relies on must not regress, and
+        the claimed-vs-allowed distinction needs a prompt that talks about
+        nothing else. Returns (parsed_DamagesSchema, usage, error).
+        """
+        if not source_text:
+            return None, None, "empty source"
+        processed = build_damages_context(source_text)
+        user_content = (
+            "Reconstruct the award breakdown from the decision below. Report "
+            "what was ALLOWED, never what was claimed or refused, and leave a "
+            "figure EMPTY rather than guessing it.\n\n"
+            "---\n"
+            f"{processed}\n"
+            "---\n"
+        )
+        return self._parse_with_retry(
+            DAMAGES_SYSTEM_INSTRUCTION, user_content, DamagesSchema,
+            context=context, reasoning_effort=DAMAGES_REASONING_EFFORT,
+        )
+
+
 class DecisionScraper:
     def __init__(self, base_url, output_folder="nsw_decisions", api_key=None):
         self.base_url = base_url
         self.output_folder = output_folder
         self.extractor = LLMExtractor(api_key) if api_key else None
-        self.cache_file = "processed_cache.json"
-        self.sidecar_file = "processed_sidecar.json"
+        self.cache_file = CACHE_FILE
+        self.sidecar_file = SIDECAR_FILE
         self.cache_lock = Lock()
         self.cache = self._load_cache()
         self.cost_tracker = CostTracker()
@@ -2440,6 +2798,10 @@ class DecisionScraper:
                     "banding_validation": row.get("_banding_validation", {}),
                     "provenance": row.get("_provenance", {}),
                     "field_review": row.get("_field_review", {}),
+                    "damages": row.get("_damages", {}),
+                    "wpi_resolution": row.get("_wpi_resolution", {}),
+                    "wpi_version": row.get("_wpi_version", 0),
+                    "damages_version": row.get("_damages_version", 0),
                 }
                 # Privacy transforms apply to the OUTPUT sidecar only; the cache
                 # keeps full data (ISSUE-011). No-op unless a privacy knob is set.
@@ -2814,7 +3176,7 @@ class DecisionScraper:
             "Future Economic Loss": fel_amount,
             "Future Economic Loss Status": fel_status,
             "Statutory Benefits": parsed.statutory_benefits,
-            "Medical Costs": parsed.medical_costs_awarded.value,
+            "Medical Costs": normalise_medical_costs(parsed.medical_costs_awarded.value),
             "Nature": parsed.decision_nature,
             "Result": parsed.decision_result,
             "Description": sanitised_case_description,
@@ -2863,6 +3225,42 @@ class DecisionScraper:
                         f"Focused second pass recovered {recovered} for {url}"
                     )
 
+        # ---- WPI resolution pass ----
+        # Fires when the source holds a WPI the strict regex refused to choose
+        # between (several figures) or none was captured at all. The model
+        # classifies the mentions; resolve_wpi does the arithmetic.
+        if wpi_resolution_applies(result, decision_text) and self.extractor                 and not self.quota_breaker.is_aborted():
+            wparsed, wusage, werr = self.extractor.extract_wpi_resolution(
+                decision_text, context=f"WPI resolution for {url}",
+            )
+            if wusage is not None:
+                token_usage["wpi_resolution"] = self.cost_tracker.record(wusage)
+            if werr or wparsed is None:
+                logging.warning(f"WPI resolution failed for {url}: {werr or 'parse failed'}")
+            else:
+                merge_wpi_resolution_into_record(result, wparsed)
+
+        # ---- Damages breakdown pass (downstream spec 2026-07-27) ----
+        # Runs after the loss gate so it sees the final Lump Sum / NEL / FEL
+        # values it has to reconcile against.
+        damages_error = ""
+        if damages_pass_applies(result) and self.extractor \
+                and not self.quota_breaker.is_aborted():
+            dparsed, dusage, derr = self.extractor.extract_damages(
+                decision_text, context=f"damages pass for {url}",
+            )
+            if dusage is not None:
+                token_usage["damages_pass"] = self.cost_tracker.record(dusage)
+            if derr or dparsed is None:
+                damages_error = derr or "damages parse failed"
+                result["Damages Extraction Status"] = "error"
+                result["Damages Notes"] = damages_error[:1000]
+                logging.warning(f"Damages pass failed for {url}: {damages_error}")
+            else:
+                merge_damages_into_record(result, dparsed)
+        elif not damages_pass_applies(result):
+            result["Damages Extraction Status"] = "not applicable"
+
         remaining_losses = detect_field_losses(result, decision_text, provenance)
 
         # ---- Needs Review (C4): only provenance-confirmed losses exclude ----
@@ -2893,6 +3291,18 @@ class DecisionScraper:
         # Re-annotate so the Needs Review flag feeds the analysis-ready gate.
         return annotate_analysis_fields(result)
 
+def damages_manifest_fields(rows):
+    """Damages-pass coverage for the run manifest, so a consumer can tell at a
+    glance which damages version produced the file and how much of it carries a
+    breakdown."""
+    ok = sum(1 for r in rows if r.get("Damages Extraction Status") == "ok")
+    return {
+        "damages_version": DAMAGES_VERSION,
+        "damages_rows_extracted": ok,
+        "damages_rows_not_run": len(rows) - ok,
+    }
+
+
 def _report_sort_key(row):
     decision_date = (row.get("Decision Date") or "").strip()
     return decision_date if has_valid_iso_date(decision_date) else "0000-00-00"
@@ -2913,8 +3323,8 @@ def generate_reports(scraper, detailed_path, analysis_ready_path, *, script,
     Returns (all_data, analysis_ready_data) of the CURRENT-schema rows written.
     """
     with scraper.cache_lock:
-        snapshot = [(u, annotate_analysis_fields(r)) for u, r in scraper.cache.items()
-                    if isinstance(r, dict)]
+        snapshot = [(u, ensure_damages_defaults(annotate_analysis_fields(r)))
+                    for u, r in scraper.cache.items() if isinstance(r, dict)]
     total_cache = len(snapshot)
     current = [(u, r) for u, r in snapshot if r.get("_schema_version") == SCHEMA_VERSION]
     stale = total_cache - len(current)
@@ -2949,6 +3359,7 @@ def generate_reports(scraper, detailed_path, analysis_ready_path, *, script,
     needs_review = sum(1 for r in all_data if str(r.get("Needs Review", "")).strip() == "Yes")
     extra = {"stale_rows_excluded": stale, "cache_rows_not_in_current_run": unseen,
              "total_cache_rows": total_cache}
+    extra.update(damages_manifest_fields(all_data))
     if manifest_extra:
         extra.update(manifest_extra)
     write_run_manifest(script=script, total_rows=len(all_data),
@@ -2964,7 +3375,8 @@ def regenerate_reports_from_cache(cache, detailed_path, analysis_ready_path, *, 
     current-schema rows only, always-write (header-only when empty), atomic,
     privacy-applied outputs, run manifest (ISSUE-001/002/015/022). Callers
     should wrap this in `dataset_lock()`."""
-    rows = [annotate_analysis_fields(r) for r in cache.values() if isinstance(r, dict)]
+    rows = [ensure_damages_defaults(annotate_analysis_fields(r))
+            for r in cache.values() if isinstance(r, dict)]
     total_cache = len(rows)
     current = [r for r in rows if r.get("_schema_version") == SCHEMA_VERSION]
     stale = total_cache - len(current)
@@ -2980,6 +3392,8 @@ def regenerate_reports_from_cache(cache, detailed_path, analysis_ready_path, *, 
     if stale:
         logging.warning(f"Excluded {stale} non-current-schema (v!={SCHEMA_VERSION}) cache rows from reports.")
     needs_review = sum(1 for r in current if str(r.get("Needs Review", "")).strip() == "Yes")
+    manifest_extra = dict(manifest_extra)
+    manifest_extra.update(damages_manifest_fields(current))
     write_run_manifest(script=script, total_rows=len(current),
                        analysis_ready_rows=len(analysis_ready),
                        needs_review_rows=needs_review,
@@ -2995,9 +3409,7 @@ def main():
         return
 
     BASE_DOMAIN = "https://www.austlii.edu.au"
-    OUTPUT_DIR = "nsw_pic_decisions"
-    CSV_REPORT = "detailed_payout_summary.csv"
-    ANALYSIS_READY_REPORT = "analysis_ready_payout_summary.csv"
+    OUTPUT_DIR = DECISIONS_DIR
     if privacy_active():
         logging.info(f"Privacy mode active for OUTPUTS: {privacy_summary()} "
                      f"(cache retains full data). Decision text is sent to the OpenAI API.")

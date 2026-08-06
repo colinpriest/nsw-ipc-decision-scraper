@@ -11,9 +11,13 @@ import logging
 import os
 
 from nsw_court_scraper import (
+    ANALYSIS_READY_REPORT,
     atomic_write_json,
+    CACHE_FILE,
     cleanup_text,
+    CSV_REPORT,
     dataset_lock,
+    DECISIONS_DIR as OUTPUT_DIR,
     extract_catchwords,
     extract_html_with_paragraph_numbers,
     regenerate_reports_from_cache,
@@ -22,10 +26,6 @@ from nsw_court_scraper import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-CACHE_FILE = "processed_cache.json"
-CSV_REPORT = "detailed_payout_summary.csv"
-ANALYSIS_READY_REPORT = "analysis_ready_payout_summary.csv"
-OUTPUT_DIR = "nsw_pic_decisions"
 
 
 def backfill():

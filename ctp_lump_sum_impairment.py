@@ -16,14 +16,18 @@ import os
 
 import pandas as pd
 
-from nsw_court_scraper import coerce_leading_number
+from nsw_court_scraper import (
+    ANALYSIS_READY_REPORT,
+    CSV_REPORT,
+    SIDECAR_FILE,
+    WORKBOOK_FILE,
+    coerce_leading_number,
+    normalise_medical_costs,
+)
+from damages_extraction import DAMAGES_NUMERIC_FIELDS, DAMAGES_SIGNED_FIELDS, to_float
 
-INPUT_CSV_CANDIDATES = [
-    "analysis_ready_payout_summary.csv",
-    "detailed_payout_summary.csv",
-]
-SIDECAR_FILE = "processed_sidecar.json"
-OUTPUT_XLSX = "ctp_impairment_lump_sum.xlsx"
+INPUT_CSV_CANDIDATES = [ANALYSIS_READY_REPORT, CSV_REPORT]
+OUTPUT_XLSX = WORKBOOK_FILE
 
 # Excel hard-limits cell text at 32,767 chars. Cap long serialised fields.
 CELL_CHAR_CAP = 32_000
@@ -118,7 +122,7 @@ NUMERIC_COERCE_COLUMNS = [
     "Work Impact Severity",
     "Pre-existing Condition Salience",
     "Legal Procedural Complexity",
-]
+] + list(DAMAGES_NUMERIC_FIELDS)
 
 
 def _truncate(text):
@@ -195,21 +199,23 @@ def build_workbook(df, sidecar):
     """Filter to the CTP payout-vs-WPI rows and build the enriched output frame.
     Pure: takes the loaded CSV frame + sidecar dict, returns the output frame.
 
-    ISSUE-005: the workbook is the payout-vs-WPI analysis input, so it MUST
-    require a positive numeric accepted WPI as well as a positive lump sum —
-    not just Case Type == CTP + lump sum."""
+    Population rule: analysis-ready CTP rows with a **positive lump sum**.
+
+    An earlier rule also required a positive accepted WPI (ISSUE-005), on the
+    reasoning that a payout-vs-WPI workbook needs both axes. That silently
+    excluded ~250 real awards whose decision simply never states a WPI, which
+    is a fact about the decision, not a defect in the row — and it made the
+    absence invisible rather than modellable. WPI now stays BLANK on those rows
+    with `WPI % Provenance = absent`, so a consumer can filter them out for a
+    WPI-conditional analysis and keep them for everything else."""
     filtered = df[
         is_analysis_ready(df)
         & (df["Case Type"] == "CTP")
         & is_positive_numeric(df["Lump Sum"])
-        & is_positive_numeric(df["Impairment % (Accepted)"])
     ].copy()
 
     if filtered.empty:
-        raise SystemExit(
-            "No analysis-ready CTP rows with positive numeric Lump Sum AND "
-            "Impairment % (Accepted)."
-        )
+        raise SystemExit("No analysis-ready CTP rows with a positive numeric Lump Sum.")
 
     enriched_records = [enrich_row(url, sidecar) for url in filtered["URL"]]
     enriched_df = pd.DataFrame(enriched_records, index=filtered.index).fillna("")
@@ -225,18 +231,54 @@ def build_workbook(df, sidecar):
 
     for col in NUMERIC_COERCE_COLUMNS:
         if col in out_df.columns:
-            out_df[col] = out_df[col].apply(_to_number)
+            # Residuals are signed; everything else uses the shared coercion,
+            # which rejects negatives on purpose.
+            coerce = to_float if col in DAMAGES_SIGNED_FIELDS else _to_number
+            out_df[col] = out_df[col].apply(coerce)
 
-    # The analysis-useful WPI is Impairment % (Accepted), populated for every
-    # filtered row. Drop the strict Impairment % (sparse, misleading), rename
-    # Accepted -> "WPI %", and move it next to Lump Sum.
+    # The analysis-useful WPI is Impairment % (Accepted). Drop the strict
+    # Impairment % (sparse, misleading), rename Accepted -> "WPI %", and move it
+    # next to Lump Sum.
     if "Impairment %" in out_df.columns:
         out_df = out_df.drop(columns=["Impairment %"])
+
+    # Spec 4.1 asked us to populate or drop three empty columns. Statutory
+    # Benefits and Medical Costs are now populated (the latter was only ever
+    # *reading* as empty — see normalise_medical_costs). Weekly Benefit is
+    # genuinely absent: a CTP damages assessment or settlement approval almost
+    # never states a weekly statutory-benefit rate, so it is dropped here
+    # rather than left implying data we do not have. The damages pass's
+    # `Weekly Statutory Benefit` stays, because it carries a provenance value
+    # that distinguishes "not stated" from "not looked for".
+    if "Weekly Benefit" in out_df.columns:
+        out_df = out_df.drop(columns=["Weekly Benefit"])
     out_df = out_df.rename(columns={"Impairment % (Accepted)": "WPI %"})
-    if "WPI %" in out_df.columns and "Lump Sum" in out_df.columns:
-        cols = list(out_df.columns)
-        cols.remove("WPI %")
-        cols.insert(cols.index("Lump Sum") + 1, "WPI %")
+
+    # WPI is no longer guaranteed present, so it needs the same provenance
+    # discipline as every other extracted figure: a blank must be readable as
+    # "the decision does not state one", not as a missing cell, and a value we
+    # computed or estimated must not read as one the decision stated.
+    out_df = out_df.rename(columns={
+        "WPI Provenance": "WPI % Provenance",
+        "WPI Basis": "WPI % Basis",
+        "WPI Candidates": "WPI % Candidates",
+    })
+    if "WPI %" in out_df.columns:
+        # Rows predating the WPI-resolution pass carry no provenance (a missing
+        # column, or a blank cell). Fall back to value-present == stated, so the
+        # column is never partially populated — a blank provenance would be
+        # indistinguishable from a blank value.
+        if "WPI % Provenance" not in out_df.columns:
+            out_df["WPI % Provenance"] = ""
+        fallback = out_df["WPI %"].map(lambda v: "absent" if pd.isna(v) else "stated")
+        blank = out_df["WPI % Provenance"].isna() | \
+            out_df["WPI % Provenance"].astype(str).str.strip().eq("")
+        out_df.loc[blank, "WPI % Provenance"] = fallback[blank]
+        wpi_cols = [c for c in ("WPI %", "WPI % Provenance", "WPI % Basis",
+                                "WPI % Candidates") if c in out_df.columns]
+        cols = [c for c in out_df.columns if c not in wpi_cols]
+        anchor = cols.index("Lump Sum") + 1 if "Lump Sum" in cols else 0
+        cols[anchor:anchor] = wpi_cols
         out_df = out_df[cols]
 
     return out_df, len(new_cols)
@@ -249,7 +291,12 @@ def main():
             f"Input CSV not found. Checked: {', '.join(INPUT_CSV_CANDIDATES)}"
         )
 
-    df = pd.read_csv(input_csv, dtype=str).fillna("")
+    # keep_default_na=False so sentinels that look like nulls to pandas —
+    # notably Medical Costs' "N/A" — survive the round trip instead of
+    # reaching the consumer as an empty column (spec 4.1).
+    df = pd.read_csv(input_csv, dtype=str, keep_default_na=False).fillna("")
+    if "Medical Costs" in df.columns:
+        df["Medical Costs"] = df["Medical Costs"].apply(normalise_medical_costs)
     required_columns = {"Case Type", "Impairment % (Accepted)", "Lump Sum", "URL"}
     missing = required_columns - set(df.columns)
     if missing:

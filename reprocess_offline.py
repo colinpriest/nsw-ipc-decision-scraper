@@ -17,6 +17,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
 from nsw_court_scraper import (
+    ANALYSIS_READY_REPORT,
+    CSV_REPORT,
+    DECISIONS_DIR,
     DecisionScraper,
     SCHEMA_VERSION,
     _is_quota_error,
@@ -114,9 +117,7 @@ def main():
         return
 
     BASE_DOMAIN = "https://www.austlii.edu.au"
-    OUTPUT_DIR = "nsw_pic_decisions"
-    CSV_REPORT = "detailed_payout_summary.csv"
-    ANALYSIS_READY_REPORT = "analysis_ready_payout_summary.csv"
+    OUTPUT_DIR = DECISIONS_DIR
 
     scraper = DecisionScraper(BASE_DOMAIN, OUTPUT_DIR, api_key)
 

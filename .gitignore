@@ -13,6 +13,13 @@ ENV/
 .env
 .env.local
 
+# Generated outputs. Everything this pipeline writes now lives under output/
+# (see OUTPUT_ROOT in nsw_court_scraper.py) — cache, sidecar, CSV reports, the
+# workbook, the run manifest, the log, and pre-transform backups.
+output/
+
+# Legacy root-level paths, kept so an old checkout does not accidentally commit
+# a 100MB cache before migrate_legacy_outputs() moves it.
 # Cache and data files
 processed_cache.json
 processed_sidecar.json
@@ -46,6 +53,10 @@ test_*.py
 test_*_output.txt
 # ...but the v3 field-reliability regression suite IS tracked source
 !test_extraction_fields.py
+# ...as is the damages-breakdown suite
+!test_damages_extraction.py
+# ...and the WPI-resolution suite
+!test_wpi_resolution.py
 
 # Logs
 *.log

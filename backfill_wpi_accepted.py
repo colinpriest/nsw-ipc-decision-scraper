@@ -26,31 +26,31 @@ from pypdf import PdfReader
 from pydantic import BaseModel, Field
 
 from nsw_court_scraper import (
-    MODEL,
-    OPENAI_TIMEOUT,
-    PRICE_INPUT_PER_M,
-    PRICE_CACHED_INPUT_PER_M,
-    PRICE_OUTPUT_PER_M,
-    REASONING_EFFORT,
-    QuotaCircuitBreaker,
     _is_quota_error,
     _is_transient_api_error,
+    ANALYSIS_READY_REPORT,
     atomic_write_json,
+    CACHE_FILE,
     cleanup_text,
+    CSV_REPORT,
     dataset_lock,
+    DECISIONS_DIR as OUTPUT_DIR,
     extract_html_with_paragraph_numbers,
     extract_wpi_confident,
     get_worker_count,
+    MODEL,
+    OPENAI_TIMEOUT,
+    PRICE_CACHED_INPUT_PER_M,
+    PRICE_INPUT_PER_M,
+    PRICE_OUTPUT_PER_M,
+    QuotaCircuitBreaker,
+    REASONING_EFFORT,
     regenerate_reports_from_cache,
     safe_decision_path,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-CACHE_FILE = "processed_cache.json"
-CSV_REPORT = "detailed_payout_summary.csv"
-ANALYSIS_READY_REPORT = "analysis_ready_payout_summary.csv"
-OUTPUT_DIR = "nsw_pic_decisions"
 
 
 # ----------------------------------------------------------------------

@@ -21,11 +21,13 @@ from dotenv import load_dotenv
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from nsw_court_scraper import (
-    DecisionScraper,
+    CACHE_FILE,
     cleanup_text,
+    DECISIONS_DIR as DECISIONS_FOLDER,
+    DecisionScraper,
     extract_html_with_paragraph_numbers,
-    safe_decision_path,
     RESULT_FIELDS,
+    safe_decision_path,
 )
 
 SAME_CASE_URLS = [
@@ -36,8 +38,6 @@ SAME_CASE_URLS = [
     "https://www.austlii.edu.au/cgi-bin/viewdoc/au/cases/nsw/NSWPIC/2022/379.html",
 ]
 
-CACHE_FILE = "processed_cache.json"
-DECISIONS_FOLDER = "nsw_pic_decisions"
 OUTPUT_FILE = "smoke_full_sample_output.txt"
 SLICE_DISPLAY_CAP = 3000
 
