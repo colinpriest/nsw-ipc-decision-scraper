@@ -33,6 +33,7 @@ from wpi_resolution import (
     WPI_SYSTEM_INSTRUCTION,
     WpiResolution,
     empty_wpi_row,
+    nel_paid_without_entitlement,
     resolve_wpi,
 )
 from damages_extraction import (
@@ -200,7 +201,7 @@ DAMAGES_VERSION = 1
 
 # Version of the WPI-resolution pass (see wpi_resolution.py). Independent of
 # SCHEMA_VERSION for the same reason as DAMAGES_VERSION.
-WPI_VERSION = 1
+WPI_VERSION = 2
 
 MODEL = "gpt-5"
 REASONING_EFFORT = "low"
@@ -512,6 +513,9 @@ def get_analysis_exclusion_reasons(row):
     if EXCLUDE_NEEDS_REVIEW and str(row.get("Needs Review", "") or "").strip() == "Yes":
         reasons.append("needs_review")
 
+    # NOTE: `_wpi_quarantined` is deliberately NOT an exclusion reason. A row
+    # whose WPI was withheld under s 4.11 keeps its place in the analysis set
+    # with `WPI %` blank — see quarantine_impossible_wpi.
     return reasons
 
 
@@ -1885,6 +1889,107 @@ def wpi_is_legally_impossible(record):
     return current is not None and current <= 10
 
 
+# Record fields that carry the Member's own words, cheapest first. Scanned for
+# the ex gratia carve-out when the full decision text is not to hand (the cache
+# backfill has no HTML for every row, and re-reading 6,600 files to answer one
+# yes/no question is not worth it when the catchwords already say so).
+WPI_REASONING_FIELDS = (
+    "Catchwords",
+    "Narrative: Legal Issues and Reasoning",
+    "Result",
+    "Award Breakdown",
+    "WPI Resolution Notes",
+)
+
+
+def wpi_award_is_ex_gratia(record, text=""):
+    """True if the decision says non-economic loss was paid without entitlement.
+
+    See `nel_paid_without_entitlement`. Checks the full text when the caller has
+    it, otherwise the stored reasoning fields.
+    """
+    return nel_paid_without_entitlement(
+        text, *(record.get(f, "") for f in WPI_REASONING_FIELDS))
+
+
+# s 4.11 is a Motor Accident Injuries Act provision. Workers compensation runs
+# on an entirely different scheme (permanent impairment under s 66 of the
+# Workers Compensation Act 1987), so a WC row awarding non-economic loss at 10%
+# WPI is not contradictory at all. Deliberately NOT the env-widenable
+# DAMAGES_CASE_TYPES: widening the damages pass to WC must not silently start
+# applying motor-accident law to WC rows.
+MAI_ACT_CASE_TYPES = ("CTP",)
+
+
+def quarantine_impossible_wpi(record, text=""):
+    """Withhold a WPI that the row's own award proves wrong. Mutates in place.
+
+    s 4.11 permits non-economic loss only above 10%, so `NEL Awarded` on a WPI
+    at or below 10 cannot both be right. The failure is nearly always the WPI -
+    a component figure ("the shoulders were equally impaired ... at 8% each")
+    or a superseded one read as the governing total. We cannot always recover
+    the true figure: where the decision never states the combined total, there
+    is nothing to promote it to. So rather than publish a number known to be
+    wrong, the value moves to `WPI Candidates` for audit and the field is
+    blanked, which keeps it out of WPI-conditional analysis instead of
+    distorting it.
+
+    Three rows are left alone:
+      * anything that is not a motor accident claim, since s 4.11 is not the
+        governing provision (see MAI_ACT_CASE_TYPES);
+      * the ex gratia case, where the low WPI is CORRECT and the insurer simply
+        paid anyway (`wpi_award_is_ex_gratia`); and
+      * rows the resolution pass already corrected to a figure above 10.
+
+    Returns True if the row was quarantined.
+    """
+    if str(record.get("Case Type", "") or "").strip() not in MAI_ACT_CASE_TYPES:
+        return False
+    if str(record.get("Non-Economic Loss Status") or "").strip() != "Awarded":
+        return False
+    value = to_float_pct(record.get("Impairment % (Accepted)"))
+    if value is None or value > 10:
+        return False
+
+    shown = str(record.get("Impairment % (Accepted)") or "").strip()
+
+    if wpi_award_is_ex_gratia(record, text):
+        # Correct data, genuinely rare law. Record why it was spared so the
+        # next reader does not re-open it as a bug.
+        record["_wpi_ex_gratia"] = True
+        note = (f"WPI {shown} with non-economic loss awarded is correct here: "
+                f"the decision states the insurer paid without any legal "
+                f"obligation to do so (s 4.11 not satisfied)")
+        record["WPI Resolution Notes"] = "; ".join(
+            x for x in [record.get("WPI Resolution Notes", ""), note] if x)[:300]
+        return False
+
+    # Keep the withheld figure visible rather than destroying it.
+    candidates = str(record.get("WPI Candidates") or "").strip()
+    if shown and shown not in [c.strip() for c in candidates.split("|")]:
+        record["WPI Candidates"] = f"{candidates} | {shown}".strip(" |")
+
+    record["Impairment % (Accepted)"] = ""
+    record["WPI Provenance"] = "absent"
+    record["WPI Basis"] = (f"withheld: {shown} contradicts the award of "
+                           f"non-economic loss, which s 4.11 permits only above 10%")
+    record["_wpi_quarantined"] = shown
+    note = (f"WPI {shown} withheld: non-economic loss was awarded, which s 4.11 "
+            f"permits only above 10% impairment")
+    record["Review Notes"] = "; ".join(
+        x for x in [record.get("Review Notes", ""), note] if x)[:1000]
+    # Deliberately NOT `Needs Review = Yes`. That flag feeds the analysis-ready
+    # gate, which would evict the whole row from the workbook over one bad
+    # field - and the rest of the row is sound (Washbourne is a complete
+    # $1,451,619 award with a full damages breakdown). A blank WPI is already
+    # the exclusion: 215 workbook rows have none, and WPI-conditional analysis
+    # filters on `WPI % Provenance = 'stated'`, which this row now fails.
+    # The trail is in `Review Notes`, `WPI % Basis` and `WPI % Candidates`;
+    # `backfill_wpi_nel_quarantine.py --dry-run` lists these rows on demand.
+    logging.warning(f"{note} for {record.get('Case Name', '')[:50]}")
+    return True
+
+
 def merge_wpi_resolution_into_record(record, parsed):
     """Merge a parsed WpiResolution into a flat record IN PLACE.
 
@@ -1946,6 +2051,13 @@ def merge_wpi_resolution_into_record(record, parsed):
         logging.warning(f"{note} for {record.get('Case Name', '')[:50]}")
         record["Review Notes"] = "; ".join(
             x for x in [record.get("Review Notes", ""), note] if x)[:1000]
+
+    # The note above records the contradiction; this withholds the value. It
+    # runs last so it sees whatever the ladder and the narrow correction above
+    # settled on, and it catches the case the threshold check cannot: a row
+    # whose threshold finding is `not determined` but which pays non-economic
+    # loss anyway, where the award itself is the evidence.
+    quarantine_impossible_wpi(record)
 
     record["_wpi_version"] = WPI_VERSION
     record["_wpi_resolution"] = {
@@ -3287,6 +3399,11 @@ class DecisionScraper:
             "second_pass": second_pass,
         }
         result["_banding_validation"] = validate_banding(sanitised_banded_description, record=result)
+
+        # Catches rows the WPI resolution pass never saw (disabled, failed, or
+        # skipped): the s 4.11 contradiction is visible from the record alone.
+        # Idempotent - a quarantined row has no value left to withhold.
+        quarantine_impossible_wpi(result, decision_text)
 
         # Re-annotate so the Needs Review flag feeds the analysis-ready gate.
         return annotate_analysis_fields(result)

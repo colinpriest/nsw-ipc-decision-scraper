@@ -519,6 +519,58 @@ def resolve_wpi(parsed, *, existing="", nel_status=""):
     return row(value, worst_prov, basis)
 
 
+# ----------------------------------------------------------------------
+# The ex gratia carve-out to s 4.11
+# ----------------------------------------------------------------------
+
+# An insurer may pay non-economic loss it does not owe. QBE v Silcocks [2023]
+# NSWPIC 24 is the pattern: 9% WPI, no entitlement, and the Member approved
+# $120,000 anyway as "an appropriate compromise ... where no legal obligation on
+# insurer to make any allowance for non-economic loss". Such a row is CORRECT -
+# a real exception to s 4.11, not a bad extraction - and must survive the
+# quarantine that catches genuine WPI errors, which would otherwise blank the
+# one figure in it that is right.
+#
+# The signal is the decision saying the entitlement was absent while the money
+# was paid anyway. Deliberately narrow: it is only ever consulted for rows that
+# already pay non-economic loss on a WPI at or below 10, so it cannot fire on an
+# ordinary case that merely recites the threshold.
+_EX_GRATIA_PATTERNS = [
+    # "no legal obligation on insurer to make any allowance for non-economic loss"
+    r"no\s+legal\s+obligation[^.]{0,120}non-?economic\s+loss",
+    r"non-?economic\s+loss[^.]{0,120}no\s+legal\s+obligation",
+    # "not obliged / not liable / under no obligation to pay non-economic loss"
+    r"(?:not\s+(?:legally\s+)?(?:obliged|liable|required|bound)|under\s+no\s+"
+    r"obligation)[^.]{0,120}non-?economic\s+loss",
+    # "no entitlement to non-economic loss" / "no legal entitlement ... yet paid"
+    r"no\s+(?:legal\s+)?entitlement[^.]{0,80}non-?economic\s+loss",
+    r"non-?economic\s+loss[^.]{0,60}no\s+(?:legal\s+)?entitlement",
+    # "unable to establish / cannot demonstrate an entitlement to NEL"
+    r"(?:unable\s+to\s+establish|cannot\s+(?:demonstrate|establish)|has\s+not\s+"
+    r"established)[^.]{0,100}entitlement[^.]{0,60}non-?economic\s+loss",
+    # "absence of legal entitlement" in the same breath as the offer
+    r"absence\s+of\s+(?:any\s+)?legal\s+entitlement",
+]
+
+_EX_GRATIA_RE = re.compile("|".join(_EX_GRATIA_PATTERNS), re.IGNORECASE | re.DOTALL)
+
+
+def nel_paid_without_entitlement(*texts):
+    """True if any text says non-economic loss was paid despite no entitlement.
+
+    Callers pass whatever they have - catchwords, the Member's reasoning, the
+    full decision. Absence of the phrase is not evidence either way; it just
+    means the row goes through the normal contradiction check.
+    """
+    for text in texts:
+        if not text:
+            continue
+        collapsed = re.sub(r"\s+", " ", str(text))
+        if _EX_GRATIA_RE.search(collapsed):
+            return True
+    return False
+
+
 # Flat columns contributed by this module.
 WPI_FIELDS = [
     "WPI Provenance",

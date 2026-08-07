@@ -510,13 +510,196 @@ def test_a_legally_impossible_value_is_the_one_exception_to_fill_only():
 
 
 def test_the_exception_does_not_fire_when_the_ladder_agrees_it_is_low():
-    """If the ladder also lands at or below 10, the captured value stands —
-    we do not manufacture a number to satisfy the statute."""
+    """We never manufacture a number to satisfy the statute. When the ladder
+    also lands at or below 10 there is nothing to promote the value to, so the
+    contradiction is resolved by WITHHOLDING rather than by inventing."""
     row = ns.build_result_record("Case", "http://x/1")
-    row.update({"Non-Economic Loss Status": "Awarded", "Impairment % (Accepted)": "8"})
+    row.update({"Case Type": "CTP", "Non-Economic Loss Status": "Awarded",
+                "Impairment % (Accepted)": "8"})
     ns.merge_wpi_resolution_into_record(row, _parsed([
         _m(8, "assessor total", assessor="Dr A")]))
-    assert row["Impairment % (Accepted)"] == "8"
+    assert row["Impairment % (Accepted)"] == ""
+    assert row["_wpi_quarantined"] == "8"
+    assert "8" in row["WPI Candidates"]
+
+
+# ----------------------------------------------------------------------
+# s 4.11 quarantine: the four real rows that reached the workbook carrying
+# non-economic loss on a WPI at or below 10%.
+# ----------------------------------------------------------------------
+
+def test_washbourne_component_figure_is_withheld_not_published():
+    """[2025] NSWPIC 334. "the shoulders were equally impaired ... at 8% each
+    and the cervical spine at 5%" — 8% is ONE SHOULDER. The Medical Panel's own
+    total is never stated, so the figure can only be withheld, not corrected.
+    The resolution pass never ran on this row, so the quarantine has to work
+    from the record alone."""
+    row = ns.build_result_record("Washbourne v QBE", "http://x/334",
+                                 status="ok", **{"Decision Date": "2025-07-10"})
+    row.update({
+        "Case Type": "CTP",
+        "Non-Economic Loss Status": "Awarded",
+        "Non-Economic Loss": "383000",
+        "Impairment % (Accepted)": "8",
+        "Result": "Damages Assessed for Applicant",
+    })
+    assert ns.quarantine_impossible_wpi(row) is True
+    assert row["Impairment % (Accepted)"] == ""
+    assert row["WPI Candidates"] == "8"
+    assert row["WPI Provenance"] == "absent"
+    assert "s 4.11" in row["Review Notes"]
+    # The rest of the row is sound — a complete $1,451,619 award with a full
+    # damages breakdown — so it keeps its place in the workbook. The blank WPI
+    # is the exclusion; the row is not.
+    annotated = ns.annotate_analysis_fields(row)
+    assert annotated["Analysis Ready"] == "Yes"
+    assert annotated["Analysis Exclusion Reason"] == ""
+    assert row["Needs Review"] != "Yes"
+
+
+def test_young_superseded_figure_is_withheld_when_concession_states_no_number():
+    """[2023] NSWPIC 473. Dr Wallace assessed 6%; the insurer then conceded the
+    impairment "would likely to exceed the 10% threshold" once scarring and
+    muscle atrophy were counted, without ever restating a percentage. The
+    ladder cannot promote 6 -> anything (10 is not ABOVE 10), so the old code
+    fell back to keeping 6."""
+    row = ns.build_result_record("AAI v Young", "http://x/473",
+                                 status="ok", **{"Decision Date": "2023-09-11"})
+    # The main extraction captured 6, which is why the fill-only fallback used
+    # to restore it after the ladder correctly refused to publish anything.
+    row.update({"Case Type": "CTP", "Non-Economic Loss Status": "Awarded",
+                "Non-Economic Loss": "270000", "Impairment % (Accepted)": "6"})
+    ns.merge_wpi_resolution_into_record(row, _parsed([
+        _m(6, "assessor total", assessor="Dr Wallace"),
+        _m(10, "threshold recital", assessor="the insurer", about_claimant=False),
+    ], threshold="above 10%"))
+    assert row["Impairment % (Accepted)"] == ""
+    assert row["_wpi_quarantined"] == "6"
+    assert ns.annotate_analysis_fields(row)["Analysis Ready"] == "Yes"
+
+
+def test_bond_is_caught_even_though_the_threshold_was_never_determined():
+    """[2024] NSWPIC 468. A settlement approval: Dr Giles 7% (left lower limb
+    only), Dr Lee 9%, and "the parties agreed that entitlement to non-economic
+    loss was enlivened". Threshold finding is `not determined`, so the
+    threshold/value consistency check cannot fire — the AWARD is the evidence."""
+    row = ns.build_result_record("QBE v Bond", "http://x/468",
+                                 status="ok", **{"Decision Date": "2024-08-26"})
+    row.update({"Case Type": "CTP", "Non-Economic Loss Status": "Awarded",
+                "Non-Economic Loss": "230000", "Impairment % (Accepted)": "9"})
+    ns.merge_wpi_resolution_into_record(row, _parsed([
+        _m(7, "assessor total", assessor="Dr Giles"),
+        _m(9, "assessor total", assessor="Dr Lee"),
+    ], rival=True, threshold="not determined"))
+    assert row["WPI Threshold Finding"] == "not determined"
+    assert row["Impairment % (Accepted)"] == ""
+    assert row["_wpi_quarantined"]
+
+
+def test_silcocks_ex_gratia_payment_is_kept_because_the_data_is_correct():
+    """[2023] NSWPIC 24. 9% WPI, no entitlement, and $120,000 approved anyway
+    as a compromise "where no legal obligation on insurer to make any allowance
+    for non-economic loss". Blanking this WPI would destroy the one figure in
+    the row that is right."""
+    row = ns.build_result_record("QBE v Silcocks", "http://x/24",
+                                 status="ok", **{"Decision Date": "2023-01-20"})
+    row.update({
+        "Case Type": "CTP",
+        "Non-Economic Loss Status": "Awarded",
+        "Non-Economic Loss": "120000",
+        "Impairment % (Accepted)": "9",
+        "Catchwords": (
+            "MOTOR ACCIDENTS - Approval of settlement; assessments of whole "
+            "person impairment 9%; notwithstanding, no entitlement non-economic "
+            "loss offer of settlement by insurer; Held - appropriate compromise "
+            "having regard to serious injury sustained and where no legal "
+            "obligation on insurer to make any allowance for non-economic loss"),
+    })
+    assert ns.quarantine_impossible_wpi(row) is False
+    assert row["Impairment % (Accepted)"] == "9"
+    assert row.get("_wpi_quarantined") in (None, "")
+    assert row["_wpi_ex_gratia"] is True
+    assert "without any legal" in row["WPI Resolution Notes"]
+    assert ns.annotate_analysis_fields(row)["Analysis Ready"] == "Yes"
+
+
+def test_ex_gratia_detector_needs_the_entitlement_language_not_just_a_threshold():
+    """The carve-out must not fire on the ordinary case that merely recites the
+    statutory bar, or every quarantine would be waived."""
+    assert w.nel_paid_without_entitlement(
+        "there is no legal obligation for the insurer to make any allowance "
+        "for non-economic loss") is True
+    assert w.nel_paid_without_entitlement(
+        "she cannot demonstrate a WPI greater than 10% and so has no "
+        "entitlement to damages for non-economic loss") is True
+    assert w.nel_paid_without_entitlement(
+        "the insurer conceded the claimant is entitled to damages for "
+        "non-economic loss") is False
+    assert w.nel_paid_without_entitlement(
+        "the parties agreed that entitlement to non-economic loss was "
+        "enlivened by the abovementioned opinions") is False
+    assert w.nel_paid_without_entitlement(
+        "damages for non-economic loss are available only where impairment "
+        "exceeds 10%") is False
+    assert w.nel_paid_without_entitlement("", None) is False
+
+
+def test_a_withheld_wpi_never_evicts_the_row_from_the_analysis_set():
+    """One bad field must not cost ~120 good ones. An earlier cut of this pass
+    set `Needs Review`, which feeds the analysis-ready gate and dropped all five
+    quarantined rows out of the workbook — including Washbourne's complete
+    $1,451,619 award, whose damages columns were never in question."""
+    row = ns.build_result_record("Case", "http://x/1",
+                                 status="ok", **{"Decision Date": "2025-07-10"})
+    row.update({"Case Type": "CTP", "Non-Economic Loss Status": "Awarded",
+                "Impairment % (Accepted)": "8", "Lump Sum": "1451619.24"})
+    assert ns.quarantine_impossible_wpi(row) is True
+    annotated = ns.annotate_analysis_fields(row)
+    assert annotated["Analysis Ready"] == "Yes"
+    assert "wpi" not in annotated["Analysis Exclusion Reason"]
+    # The audit trail survives instead.
+    assert row["Review Notes"] and row["WPI Candidates"] == "8"
+    assert row["Lump Sum"] == "1451619.24"
+
+
+def test_workers_compensation_rows_are_out_of_scope_for_s_411():
+    """Birleson and Tysoe v State of NSW (NSW Police Force) both award
+    non-economic loss at 10% WPI. That is a workers compensation matter under
+    the Workers Compensation Act 1987, not a motor accident under the MAI Act,
+    so there is no contradiction to quarantine and blanking the WPI would be
+    applying the wrong statute."""
+    for case_type in ("Workers Compensation", "Dust Diseases", "", "Other"):
+        row = ns.build_result_record("Birleson v State of NSW", "http://x/wc")
+        row.update({"Case Type": case_type, "Non-Economic Loss Status": "Awarded",
+                    "Non-Economic Loss": "22500", "Impairment % (Accepted)": "10"})
+        assert ns.quarantine_impossible_wpi(row) is False, case_type
+        assert row["Impairment % (Accepted)"] == "10"
+
+
+def test_exactly_ten_percent_does_not_clear_the_threshold():
+    """s 4.11 requires impairment GREATER THAN 10%, so a CTP row awarding
+    non-economic loss at exactly 10 is still contradictory. Singh, Ristevski."""
+    row = ns.build_result_record("Allianz v Singh", "http://x/singh")
+    row.update({"Case Type": "CTP", "Non-Economic Loss Status": "Awarded",
+                "Impairment % (Accepted)": "10"})
+    assert ns.quarantine_impossible_wpi(row) is True
+
+
+def test_quarantine_is_idempotent_and_leaves_lawful_rows_alone():
+    row = ns.build_result_record("Case", "http://x/1")
+    row.update({"Case Type": "CTP", "Non-Economic Loss Status": "Awarded",
+                "Impairment % (Accepted)": "8"})
+    assert ns.quarantine_impossible_wpi(row) is True
+    assert ns.quarantine_impossible_wpi(row) is False   # nothing left to withhold
+    assert row["WPI Candidates"] == "8"                 # not duplicated
+
+    for status, wpi in (("Awarded", "14"), ("Nil", "8"), ("Not addressed", "3"),
+                        ("Awarded", "")):
+        ok = ns.build_result_record("Case", "http://x/2")
+        ok.update({"Case Type": "CTP", "Non-Economic Loss Status": status,
+                   "Impairment % (Accepted)": wpi})
+        assert ns.quarantine_impossible_wpi(ok) is False
+        assert ok["Impairment % (Accepted)"] == wpi
 
 
 def _run():

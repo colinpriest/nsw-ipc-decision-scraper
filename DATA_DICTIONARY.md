@@ -82,8 +82,8 @@ All money is AUD as a bare number — no `$`, no thousands separators. Dates are
 | column | type | coverage | notes |
 |---|---|---|---|
 | `Lump Sum` | number | 100% | **This is the GROSS sum, not net — see §5.** |
-| `WPI %` | number | **60.0%** | The WPI the award is calibrated against (accepted, whether assessed here or in a prior MAS certificate). Blank where the decision does not state one |
-| `WPI % Provenance` | enum | 100% | `stated` 315 · `inferred` 9 · `absent` 216. **Exclude `inferred` for WPI-conditional analysis** — those are central estimates of competing assessments, not figures the decision states |
+| `WPI %` | number | **59.3%** | The WPI the award is calibrated against (accepted, whether assessed here or in a prior MAS certificate). Blank where the decision does not state one, and blank where the row's own award of non-economic loss proves the captured figure wrong — see §3.1 |
+| `WPI % Provenance` | enum | 100% | `stated` 310 · `inferred` 9 · `derived` 1 · `absent` 220. **Exclude `inferred` for WPI-conditional analysis** — those are central estimates of competing assessments, not figures the decision states |
 | `WPI % Basis` | text | 100% | how the figure was resolved: `tribunal selected`, `MAS certificate`, `assessor total`, `combined from N components (AMA Combined Values)`, `median of N competing assessments`, `withheld: … contradicts …`, or `retained from main extraction` |
 | `WPI % Candidates` | text | 29% | every distinct percentage found in the decision, ` \| `-delimited, so an outlier can be audited |
 | `WPI Threshold Finding` | enum | 29% | `above 10%` / `not above 10%` / `not determined` — **the legally operative fact under s 4.11**, often settled without any percentage being stated. Populated on the 158 rows the resolution pass examined |
@@ -97,6 +97,28 @@ All money is AUD as a bare number — no `$`, no thousands separators. Dates are
 | `Nature` / `Result` | text | 100% | Dispute category and short legal summary |
 
 > **Dropped:** `Weekly Benefit`. The spec asked us to populate it or drop it. We looked: a CTP damages assessment or settlement approval essentially never states a weekly statutory-benefit rate (1 row in 540). It is dropped from the workbook rather than left implying data we do not have. It remains in `output/detailed_payout_summary.csv`, where it is meaningful for workers-compensation rows.
+
+### 3.1 The s 4.11 quarantine — five blank WPIs
+
+s 4.11 of the Motor Accident Injuries Act 2017 permits damages for non-economic loss **only where whole person impairment exceeds 10%**. So a row carrying `Non-Economic Loss Status = Awarded` alongside a `WPI %` at or below 10 is self-contradictory, and on audit the WPI is the wrong half nearly every time:
+
+| case | captured | what it actually was |
+|---|---|---|
+| Washbourne [2025] NSWPIC 334 | 8% | ONE SHOULDER — "the shoulders were equally impaired … at 8% each and the cervical spine at 5%". Combines to ~20%; the Medical Panel's own total is never stated |
+| Young [2023] NSWPIC 473 | 6% | Dr Wallace's figure, superseded by the insurer's concession that with scarring and muscle atrophy impairment "would likely to exceed the 10% threshold" |
+| Bond [2024] NSWPIC 468 | 9% | Dr Lee's partial assessment. A settlement approval; "the parties agreed that entitlement … was enlivened", so nothing was ever certified |
+| Singh [2024] NSWPIC 313 | 10% | the concession that injuries "**exceeded** 10%", plus a physical-only figure on a claimant who also had psychological injury |
+| Ristevski [2023] NSWPIC 400 | 10% | Dr Gothelf's **shoulder-only** figure; the PTSD and major depressive disorder were assessed separately |
+
+Because the governing total is usually never stated, these cannot be corrected — only withheld. Each row now has `WPI %` blank, `WPI % Provenance = absent`, and the withheld figure preserved in `WPI % Candidates` so it can be audited.
+
+**The rows themselves stay in this workbook.** Only the impairment figure was wrong; the damages columns are sound, and Washbourne in particular is a complete $1,451,619 award with a full breakdown. A blank `WPI %` is already the exclusion that matters — 220 rows here have none, and WPI-conditional analysis filters on `WPI % Provenance = 'stated'`, which these five now fail. Evicting the whole row would cost ~120 good fields to suppress one bad one. `Needs Review` is deliberately **not** set for the same reason: it feeds the analysis-ready gate. The audit trail lives in `Review Notes`, `WPI % Basis` and `WPI % Candidates`.
+
+> **The one exception.** Silcocks [2023] NSWPIC 24 stays, at 9% WPI with $120,000 of non-economic loss, because the decision says the insurer paid what it did not owe: an "appropriate compromise … where **no legal obligation on insurer to make any allowance for non-economic loss**". That row is correct, and a blanket rule would have destroyed the one figure in it that is right. `WPI Resolution Notes` records why it was spared.
+
+Two scope limits worth knowing: the rule applies **only to `Case Type = CTP`** (workers compensation runs on s 66 of the Workers Compensation Act 1987, where 10% WPI with non-economic loss is unremarkable — Birleson and Tysoe v State of NSW are both untouched), and it tests **`> 10`, not `>= 10`**, because that is what the section says.
+
+Re-run with `python backfill_wpi_nel_quarantine.py --dry-run`.
 
 ---
 
