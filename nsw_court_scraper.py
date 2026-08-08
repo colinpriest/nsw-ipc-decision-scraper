@@ -33,10 +33,24 @@ from wpi_resolution import (
     WPI_SYSTEM_INSTRUCTION,
     WpiResolution,
     empty_wpi_row,
+    classify_split_wpi_absence,
+    derive_threshold_finding,
+    governing_system,
     nel_paid_without_entitlement,
+    nel_threshold_consistency,
     resolve_wpi,
+    BodySystemEnum,
+    NelConsistencyEnum,
+    GoverningSystemEnum,
+    to_pct,
+    ThresholdBasisEnum,
+    ThresholdFindingEnum,
+    WpiProvenanceEnum,
 )
 from damages_extraction import (
+    PROVENANCE_ABSENCE,
+    damages_residual,
+    refine_money_absence,
     DAMAGES_CASE_TYPES,
     DAMAGES_FIELDS,
     DAMAGES_PASS_ENABLED,
@@ -1912,6 +1926,217 @@ def wpi_award_is_ex_gratia(record, text=""):
         text, *(record.get(f, "") for f in WPI_REASONING_FIELDS))
 
 
+def apply_money_absence_semantics(record):
+    """Round 3 §11: give every empty money cell a reason. Mutates in place.
+
+    Thin wrapper — the rules live in `damages_extraction` so they stay
+    testable without importing the scraper. Skipped where the damages pass
+    never ran, because on those rows the money columns are defaults rather
+    than findings and classifying a default would assert something we did not
+    look for.
+    """
+    if str(record.get("Damages Extraction Status") or "").strip() != "ok":
+        return record
+    residual, trustworthy = damages_residual(record)
+    return refine_money_absence(record, residual=residual,
+                                residual_trustworthy=trustworthy)
+
+
+def apply_round2_semantics(record):
+    """Applicability semantics for the WPI columns. Mutates in place.
+
+    Round 2 of the downstream spec asked for one thing: make "the answer is no"
+    distinguishable from "we do not know". Everything here is decided from
+    columns the row already carries plus the classified mentions in
+    `_wpi_resolution`, so it replays offline over the cache — no model call, and
+    no judgement that cannot be re-derived and checked.
+
+    Four changes, in dependency order:
+
+    1. The psychiatric gate is made self-consistent. A separately-stated
+       psychiatric percentage on a row flagged `Has Psychiatric Injury = No` is
+       a contradiction; `Injury Categories` arbitrates, because it is the
+       multi-label field built to record exactly this and it disagrees with the
+       body-system label often enough to matter. Mason [2024] NSWPIC 348 is the
+       case in point: the "psychiatric" 6% is emotional and behavioural
+       functioning inside a traumatic BRAIN INJURY assessment, which is why
+       Professor Cameron combined it with a 7% shoulder to certify 13%.
+       Psychiatric impairment would never have been combined that way.
+    2. `WPI Governing System` promotes what `resolve_wpi` already works out
+       internally to a column.
+    3. Each empty split-WPI cell gets a reason rather than a bare `absent`.
+    4. `NEL Threshold Consistent` reports the s 4.11 disagreement.
+    """
+    mentions = (record.get("_wpi_resolution") or {}).get("mentions") or []
+    notes = []
+
+    phys = str(record.get("WPI Physical %") or "").strip()
+    psych = str(record.get("WPI Psychiatric %") or "").strip()
+    total = str(record.get("Impairment % (Accepted)") or "").strip()
+    has_psych = str(record.get("Has Psychiatric Injury") or "").strip() == "Yes"
+    categories = [c.strip().lower()
+                  for c in str(record.get("Injury Categories") or "").split("|")]
+
+    # --- 1. gate consistency -------------------------------------------------
+    if psych and not has_psych:
+        if "psychiatric" in categories:
+            # Two independent signals say psychiatric; the flag is the outlier.
+            record["Has Psychiatric Injury"] = "Yes"
+            has_psych = True
+            notes.append("Has Psychiatric Injury corrected to Yes: a psychiatric "
+                         "impairment percentage was separately assessed")
+        else:
+            # No psychiatric injury on any other signal, so the percentage is
+            # misattributed - it belongs to another body system's assessment.
+            notes.append(f"WPI Psychiatric % {psych} withdrawn: no psychiatric "
+                         f"injury is established on this row, so the figure "
+                         f"belongs to another body system's assessment")
+            record["WPI Psychiatric %"] = ""
+            psych = ""
+
+    # --- 1b. recover a component the total already determines (round 5 §13.1) -
+    # Physical and psychiatric are assessed separately and the GREATER governs,
+    # so the accepted total IS one of the two components. Where one component is
+    # stated and the total EXCEEDS it, the other component must be the greater
+    # one — and therefore equals the total. This is exact, not an estimate.
+    #
+    # Verified against source on all 11 rows it fires on. Quigley [2026] NSWPIC
+    # 280 is the instructive one: MAS Curtin certified 4% (scarring, nerve) and
+    # a Review Panel 8% (brain injury, shoulder) — DIFFERENT injuries, so they
+    # combine to 12 rather than competing, and MAS Lahz's combined certificate
+    # independently certifies "greater than 10%". The resolution ladder had
+    # read them as rival assessments and taken the median, 6; the total of 12
+    # was right and the ladder's per-system figure was not, which is why this
+    # recovers from the TOTAL rather than from the ladder's arithmetic.
+    # ONE DIRECTION ONLY — psychiatric known, physical recovered. The mirror
+    # case does not hold: a total above the stated PHYSICAL figure is far more
+    # often further physical components combining than a larger psychiatric
+    # assessment. Mason [2024] NSWPIC 348 is the counter-example — 7% shoulder
+    # and 6% emotional/behavioural combine to 13% inside ONE brain-injury
+    # assessment, and running this rule backwards there invents a 13%
+    # psychiatric impairment on a claimant with no psychiatric injury at all.
+    if psych and not phys:
+        known_value, total_value = to_pct(psych), to_pct(total)
+        if known_value is not None and total_value is not None \
+                and total_value > known_value:
+            record["WPI Physical %"] = total
+            # The recovered component is exactly as good as the total it came from.
+            record["WPI Physical % Provenance"] = (
+                str(record.get("WPI Provenance") or "").strip()
+                or WpiProvenanceEnum.STATED.value)
+            notes.append(f"WPI Physical % {total} recovered: the accepted total "
+                         f"exceeds psychiatric {psych}, and the greater body "
+                         f"system governs, so the total is the physical figure")
+            phys = total
+
+    # --- 2. governing system -------------------------------------------------
+    # Round 5 §13: the resolution pass computes this from the classified
+    # mentions and is authoritative. Deriving it here from which cells are
+    # populated was circular — with one component captured it could only name
+    # the component we held, which put 145 rows in a self-fulfilling label and
+    # contradicted the resolution's own notes on the rows that mattered.
+    resolved_governing = str(record.get("WPI Governing System") or "").strip()
+    if resolved_governing in ("", GoverningSystemEnum.NOT_STATED.value):
+        record["WPI Governing System"] = governing_system(phys, psych, total)
+
+    # Both systems stated and no total is a gap the greater-governs rule can
+    # close without judgement. Cowper [2025] NSWPIC 596: Assessors Fitzsimons
+    # and Jeyasingam each found 0%, so the accepted WPI is 0 — an assessment,
+    # not a null. FILL ONLY: an existing total is never overwritten, so a row
+    # whose total took the lesser system is reported by `WPI Governing System`
+    # rather than silently rewritten.
+    if not total and phys and psych:
+        governing = max(to_float_pct(phys) or 0.0, to_float_pct(psych) or 0.0)
+        total = f"{governing:g}"
+        record["Impairment % (Accepted)"] = total
+        record["WPI Provenance"] = WpiProvenanceEnum.DERIVED.value
+        record["WPI Basis"] = "; ".join(x for x in [
+            record.get("WPI Basis", ""),
+            f"greater of physical {phys} and psychiatric {psych} "
+            f"(assessed separately; the greater governs)"] if x)[:300]
+
+    # --- 3. why each split cell is empty ------------------------------------
+    psychiatric_only = categories == ["psychiatric"]
+    for system, value, column in (
+            (BodySystemEnum.PHYSICAL.value, phys, "WPI Physical %"),
+            (BodySystemEnum.PSYCHIATRIC.value, psych, "WPI Psychiatric %")):
+        prov_col = f"{column} Provenance"
+        if value:
+            # A figure that IS present keeps whatever positive provenance it had.
+            if record.get(prov_col) in (None, "", *PROVENANCE_ABSENCE):
+                record[prov_col] = WpiProvenanceEnum.STATED.value
+            continue
+        record[prov_col] = classify_split_wpi_absence(
+            system=system, has_psychiatric=has_psych, total_present=bool(total),
+            mentions=mentions, psychiatric_only=psychiatric_only)
+
+    # The accepted WPI itself: an empty cell with no evidence of any assessment
+    # is `not_assessed`, not a defect. A withheld one stays `absent` — we know
+    # the decision quantified impairment and we could not produce the total.
+    if total:
+        if not str(record.get("WPI Provenance") or "").strip():
+            record["WPI Provenance"] = WpiProvenanceEnum.STATED.value
+    elif record.get("_wpi_ex_gratia"):
+        # Set by the quarantine, and deliberately not reclassified: the
+        # threshold question does not arise, which is a stronger and truer
+        # statement than any of the "we looked and found nothing" values.
+        record["WPI Provenance"] = WpiProvenanceEnum.NOT_APPLICABLE.value
+    elif not record.get("_wpi_quarantined"):
+        if record.get("WPI Provenance") in (None, "", *PROVENANCE_ABSENCE):
+            record["WPI Provenance"] = classify_split_wpi_absence(
+                system=BodySystemEnum.UNCLEAR.value, has_psychiatric=has_psych,
+                total_present=False, mentions=mentions)
+
+    # --- 4. s 4.11 consistency ----------------------------------------------
+    # Computed from the finding AS THE DECISION MADE IT, before step 5 fills
+    # any gap by deduction. Deducing "above 10%" from the award and then
+    # checking the award against it would make every row agree with itself.
+    stated_finding = str(record.get("WPI Threshold Finding") or "").strip()
+    # A finding THIS PASS deduced on an earlier run is not a judicial finding,
+    # however it looks in the column now. Without this, a second run promotes
+    # every deduction to `decision` and the consistency check starts reading a
+    # deduction from the award as independent evidence about the award.
+    if str(record.get("WPI Threshold Finding Basis") or "").strip() in (
+            ThresholdBasisEnum.FROM_NEL_AWARD.value,
+            ThresholdBasisEnum.FROM_WPI.value):
+        stated_finding = ""
+
+    if record.get("_wpi_ex_gratia"):
+        # The award was not predicated on the impairment finding at all, so the
+        # rule has nothing to say about it. Reporting `no` here would describe
+        # a lawful payment as a violation on every downstream ingest.
+        record["NEL Threshold Consistent"] = NelConsistencyEnum.UNKNOWN.value
+    else:
+        record["NEL Threshold Consistent"] = nel_threshold_consistency(
+            nel_status=record.get("Non-Economic Loss Status"),
+            threshold_finding=stated_finding,
+            wpi=total)
+
+    # --- 5. threshold coverage (§10.3) --------------------------------------
+    if stated_finding and stated_finding != ThresholdFindingEnum.NONE.value:
+        record["WPI Threshold Finding Basis"] = ThresholdBasisEnum.DECISION.value
+    else:
+        finding, basis = derive_threshold_finding(
+            nel_status=record.get("Non-Economic Loss Status"),
+            wpi=total,
+            ex_gratia=bool(record.get("_wpi_ex_gratia")))
+        # An explicit `not determined` from the decision is a real fact — the
+        # court declined to decide — and outranks a deduction only when the
+        # deduction found nothing either. Otherwise the deduction adds signal
+        # the empty cell did not have.
+        if finding != ThresholdFindingEnum.NONE.value:
+            record["WPI Threshold Finding"] = finding
+            record["WPI Threshold Finding Basis"] = basis
+        else:
+            record["WPI Threshold Finding"] = ThresholdFindingEnum.NONE.value
+            record["WPI Threshold Finding Basis"] = ThresholdBasisEnum.NONE.value
+
+    if notes:
+        record["WPI Resolution Notes"] = "; ".join(
+            x for x in [record.get("WPI Resolution Notes", ""), *notes] if x)[:400]
+    return record
+
+
 # s 4.11 is a Motor Accident Injuries Act provision. Workers compensation runs
 # on an entirely different scheme (permanent impairment under s 66 of the
 # Workers Compensation Act 1987), so a WC row awarding non-economic loss at 10%
@@ -1954,14 +2179,28 @@ def quarantine_impossible_wpi(record, text=""):
     shown = str(record.get("Impairment % (Accepted)") or "").strip()
 
     if wpi_award_is_ex_gratia(record, text):
-        # Correct data, genuinely rare law. Record why it was spared so the
-        # next reader does not re-open it as a bug.
+        # The figure is CORRECT — this is the one lawful way non-economic loss
+        # is paid below the threshold — but publishing it makes every
+        # downstream s 4.11 check read the row as an impossible combination,
+        # because a checker comparing WPI to 10 cannot see that the payment was
+        # never made under s 4.11 at all. So the value is withheld here too,
+        # with a provenance that says the threshold question does not arise
+        # rather than one that claims a defect. The figure stays in
+        # `WPI % Candidates`.
         record["_wpi_ex_gratia"] = True
-        note = (f"WPI {shown} with non-economic loss awarded is correct here: "
-                f"the decision states the insurer paid without any legal "
-                f"obligation to do so (s 4.11 not satisfied)")
+        candidates = str(record.get("WPI Candidates") or "").strip()
+        if shown and shown not in [c.strip() for c in candidates.split("|")]:
+            record["WPI Candidates"] = f"{candidates} | {shown}".strip(" |")
+        record["Impairment % (Accepted)"] = ""
+        record["WPI Provenance"] = WpiProvenanceEnum.NOT_APPLICABLE.value
+        record["WPI Basis"] = (
+            f"withheld: {shown} is correct but no s 4.11 threshold applies — "
+            f"the insurer paid non-economic loss without any legal obligation")
+        note = (f"WPI {shown} withheld as not applicable: the decision states "
+                f"the insurer paid non-economic loss without any legal "
+                f"obligation to do so, so the s 4.11 threshold does not arise")
         record["WPI Resolution Notes"] = "; ".join(
-            x for x in [record.get("WPI Resolution Notes", ""), note] if x)[:300]
+            x for x in [record.get("WPI Resolution Notes", ""), note] if x)[:400]
         return False
 
     # Keep the withheld figure visible rather than destroying it.
@@ -2006,6 +2245,7 @@ def merge_wpi_resolution_into_record(record, parsed):
     resolved = resolve_wpi(parsed, existing=existing,
                            nel_status=record.get("Non-Economic Loss Status", ""))
     value = resolved.pop("Impairment % (Accepted)", "")
+    systems = resolved.pop("_wpi_systems", None) or {}
     provenance = resolved.get("WPI Provenance", "absent")
 
     if not existing:
@@ -2036,6 +2276,27 @@ def merge_wpi_resolution_into_record(record, parsed):
         resolved["WPI Provenance"] = "stated"
         resolved["WPI Basis"] = "retained from main extraction"
     record.update(resolved)
+
+    # Round 6 §14.1: a governing-system label asserts that the two components
+    # were COMPARED, so they cannot simultaneously be `absent`. Where the
+    # resolution reduced both systems, carry them into the split columns.
+    # Only when BOTH resolved — `WPI Physical %` is defined as populated only
+    # where the decision states physical and psychiatric separately, so filling
+    # from a single system would break that contract.
+    if len(systems) > 1:
+        for system, column in ((BodySystemEnum.PHYSICAL.value, "WPI Physical %"),
+                               (BodySystemEnum.PSYCHIATRIC.value, "WPI Psychiatric %")):
+            if str(record.get(column) or "").strip() or system not in systems:
+                continue
+            resolved_value, resolved_prov, resolved_basis = systems[system]
+            if not resolved_value:
+                continue
+            record[column] = resolved_value
+            record[f"{column} Provenance"] = resolved_prov
+            note = (f"{column} {resolved_value} carried from the resolution "
+                    f"({resolved_basis})")
+            record["WPI Resolution Notes"] = "; ".join(
+                x for x in [record.get("WPI Resolution Notes", ""), note] if x)[:400]
 
     # Row-level consistency: the threshold finding and the value must agree.
     # s 4.11 makes non-economic loss available only ABOVE 10%, so a row saying
@@ -3404,6 +3665,11 @@ class DecisionScraper:
         # skipped): the s 4.11 contradiction is visible from the record alone.
         # Idempotent - a quarantined row has no value left to withhold.
         quarantine_impossible_wpi(result, decision_text)
+
+        # Runs after the quarantine so the applicability columns describe the
+        # WPI the row actually publishes, not the one it was about to withhold.
+        apply_round2_semantics(result)
+        apply_money_absence_semantics(result)
 
         # Re-annotate so the Needs Review flag feeds the analysis-ready gate.
         return annotate_analysis_fields(result)

@@ -128,9 +128,15 @@ def test_to_float():
 def test_not_addressed_never_carries_an_amount():
     amount, prov, status, issues = dx.apply_head_status("50000", "stated", "Not addressed")
     assert amount == ""
-    assert prov == "absent"
+    # §10.1: "the head was never in issue" is not_assessed, not a defect.
+    assert prov == "not_assessed"
     assert status == "Not addressed"
     assert issues
+
+    # A fatality/dependency claim cannot carry an ordinary head at all, which
+    # is the stronger statement.
+    _a, prov_f, _s, _i = dx.apply_head_status("", "absent", "Nil", fatality=True)
+    assert prov_f == "not_applicable"
 
 
 def test_nil_is_a_genuine_zero():
@@ -291,7 +297,7 @@ def test_every_money_field_carries_a_provenance_value():
     flat, _, _ = dx.normalise_damages(_parsed(), existing={})
     row = dx.empty_damages_row()
     row.update(flat)
-    valid = {"stated", "derived", "inferred", "absent"}
+    valid = set(dx.PROVENANCE_NON_DEFECT) | {"absent"}
     for _amount_col, prov_col in dx.MONEY_PROVENANCE_PAIRS:
         assert row.get(prov_col) in valid, prov_col
 
@@ -299,7 +305,9 @@ def test_every_money_field_carries_a_provenance_value():
 def test_split_wpi_is_not_invented():
     flat, _, _ = dx.normalise_damages(_parsed(), existing={})
     assert flat["WPI Physical %"] == ""
-    assert flat["WPI Physical % Provenance"] == "absent"
+    # The damages pass records only that it has no figure; WHY it has none is
+    # decided by `apply_round2_semantics`, which can see the whole row.
+    assert flat["WPI Physical % Provenance"] in ("absent", "not_assessed")
 
     flat, _, _ = dx.normalise_damages(
         _parsed(wpi_physical_percent="12", wpi_psychiatric_percent="8"), existing={})
@@ -434,7 +442,9 @@ def test_medical_costs_sentinel_survives_a_pandas_round_trip():
 
 def test_workbook_population_requires_lump_sum_only():
     """A decision that never states a WPI is still a real award. Blank WPI must
-    keep the row and be marked `absent`, not silently drop it."""
+    keep the row and be marked with a reason, not silently dropped. Round 2
+    §10.1: the reason is `not_assessed`, since `absent` now claims we lost a
+    figure the decision actually gave."""
     import pandas as pd
 
     import ctp_lump_sum_impairment as ctp
@@ -452,7 +462,7 @@ def test_workbook_population_requires_lump_sum_only():
 
     assert sorted(out["URL"]) == ["u1", "u2"], "blank-WPI CTP award must be kept"
     assert out.loc[out["URL"].eq("u1"), "WPI % Provenance"].item() == "stated"
-    assert out.loc[out["URL"].eq("u2"), "WPI % Provenance"].item() == "absent"
+    assert out.loc[out["URL"].eq("u2"), "WPI % Provenance"].item() == "not_assessed"
     assert pd.isna(out.loc[out["URL"].eq("u2"), "WPI %"].item())
     # Provenance sits next to the value it describes.
     cols = list(out.columns)

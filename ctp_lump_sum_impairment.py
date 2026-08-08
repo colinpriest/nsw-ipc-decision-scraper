@@ -270,7 +270,12 @@ def build_workbook(df, sidecar):
         # indistinguishable from a blank value.
         if "WPI % Provenance" not in out_df.columns:
             out_df["WPI % Provenance"] = ""
-        fallback = out_df["WPI %"].map(lambda v: "absent" if pd.isna(v) else "stated")
+        # `not_assessed`, not `absent`: round 2 §10.1 made `absent` mean "the
+        # decision quantified it and we missed it", which is a defect claim
+        # this fallback has no evidence for — it fires precisely on rows the
+        # WPI pass never examined.
+        fallback = out_df["WPI %"].map(
+            lambda v: "not_assessed" if pd.isna(v) else "stated")
         blank = out_df["WPI % Provenance"].isna() | \
             out_df["WPI % Provenance"].astype(str).str.strip().eq("")
         out_df.loc[blank, "WPI % Provenance"] = fallback[blank]

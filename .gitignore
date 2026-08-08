@@ -57,6 +57,12 @@ test_*_output.txt
 !test_damages_extraction.py
 # ...and the WPI-resolution suite
 !test_wpi_resolution.py
+# ...and the downstream applicability rounds (2-6)
+!test_round2_applicability.py
+!test_round3_money_absence.py
+!test_round4_statutory_benefits.py
+!test_round5_governing_system.py
+!test_round6_split_recovery.py
 
 # Logs
 *.log

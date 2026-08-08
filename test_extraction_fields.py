@@ -523,8 +523,9 @@ def test_ctp_excel_requires_a_lump_sum_not_a_wpi():
     """Population rule: a positive lump sum. The earlier rule also demanded a
     positive accepted WPI (ISSUE-005), which dropped ~250 real awards whose
     decision simply never states one. Those rows are now kept with a blank
-    WPI and `WPI % Provenance = absent`, so the absence is modellable instead
-    of invisible. See test_workbook_population_requires_lump_sum_only in
+    WPI and a provenance that says WHY (round 2 §10.1: `not_assessed` here —
+    nothing in the row evidences an assessment), so the absence is modellable
+    instead of invisible. See test_workbook_population_requires_lump_sum_only in
     test_damages_extraction.py for the provenance detail."""
     import pandas as pd
     import ctp_lump_sum_impairment as ctp
@@ -539,7 +540,7 @@ def test_ctp_excel_requires_a_lump_sum_not_a_wpi():
     out, _ = ctp.build_workbook(df, {})
     assert sorted(out["URL"]) == ["a", "b"]
     assert "WPI %" in out.columns and "Impairment % (Accepted)" not in out.columns
-    assert list(out["WPI % Provenance"]) == ["stated", "absent"]
+    assert list(out["WPI % Provenance"]) == ["stated", "not_assessed"]
 
 
 # ----------------------------------------------------------------------

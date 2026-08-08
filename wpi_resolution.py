@@ -58,6 +58,10 @@ WPI_RESOLUTION_ENABLED = os.getenv("NSW_WPI_RESOLUTION", "1") not in ("0", "fals
 # outlier expert) or mean. Median == mean for the common two-assessment case.
 WPI_CENTRAL_ESTIMATE = os.getenv("NSW_WPI_CENTRAL_ESTIMATE", "median").strip().lower()
 
+# A medical review panel reviews an existing MAS certificate and may revoke it
+# (s 7.26 MAI Act), so its figure supersedes rather than competes.
+_REVIEW_PANEL_RE = re.compile(r"review\s*panel|medical\s*panel|\bpanel\b", re.I)
+
 
 # ----------------------------------------------------------------------
 # Enums
@@ -91,9 +95,16 @@ class ThresholdFindingEnum(str, Enum):
 
 
 class WpiProvenanceEnum(str, Enum):
+    """Deliberately the same vocabulary as `damages_extraction.ProvenanceEnum`,
+    including the round-2 §10.1 split of `absent` into WHY it is absent. The two
+    enums are kept parallel rather than shared so neither module depends on the
+    other; `test_round2_applicability` asserts they stay in step."""
     STATED = "stated"
     DERIVED = "derived"
     INFERRED = "inferred"
+    NOT_APPLICABLE = "not_applicable"
+    NOT_ASSESSED = "not_assessed"
+    NOT_STATED = "not_stated"
     ABSENT = "absent"
 
 
@@ -357,7 +368,9 @@ def resolve_wpi(parsed, *, existing="", nel_status=""):
                          for m in (getattr(parsed, "mentions", None) or [])
                          if to_pct(getattr(m, "value", None)) is not None})
 
-    def row(value, provenance, basis, notes=""):
+    systems_out = {}
+
+    def row(value, provenance, basis, notes="", governing=None):
         return {
             "Impairment % (Accepted)": _fmt_pct(value),
             "WPI Provenance": provenance,
@@ -366,6 +379,19 @@ def resolve_wpi(parsed, *, existing="", nel_status=""):
             "WPI Threshold Finding": _enum(getattr(parsed, "threshold_finding", None))
                                      or ThresholdFindingEnum.NONE.value,
             "WPI Resolution Notes": (notes or getattr(parsed, "notes", "") or "")[:300],
+            # Round 5 §13: emitted HERE, from the same `systems` dict that
+            # writes "higher of N body systems (x)" into the basis, rather than
+            # re-derived downstream from which cells happen to be populated.
+            # That derivation was circular — with one component captured it
+            # could only ever name the component we held.
+            "WPI Governing System": governing or GoverningSystemEnum.NOT_STATED.value,
+            # Round 6 §14.1: the per-system figures the comparison was made
+            # from. A governing-system label asserts that a comparison happened,
+            # so the components it compared cannot simultaneously be `absent` —
+            # carrying them here lets the split columns be filled from the same
+            # authority that names the winner, instead of being reconstructed.
+            # Underscore-prefixed, so it stays out of the CSV.
+            "_wpi_systems": dict(systems_out or {}),
         }
 
     # --- 1. the tribunal actually settled on a figure ---
@@ -424,7 +450,25 @@ def resolve_wpi(parsed, *, existing="", nel_status=""):
         if finds:
             per_assessor, source = assessor_totals(finds, False), "tribunal finding"
         elif certs:
-            per_assessor, source = assessor_totals(certs, False), "MAS certificate"
+            # A REVIEW PANEL certificate is not a rival opinion — under s 7.26
+            # a panel may revoke the original certificate and issue its own, so
+            # the earlier one is superseded, not competing. Averaging the two
+            # produced a figure neither assessor ever gave: Tiwari [2026] NSWPIC
+            # 251 had MAS Oates at 0% and the Review Panel at 12%, and the
+            # median of 6 made psychiatric (7%) look like the governing system
+            # when physical governs at 12.
+            # Only where the certificates are RIVAL readings of the same
+            # impairment. Where they cover DIFFERENT injuries they combine, and
+            # a panel that reviewed one of them does not supersede the other:
+            # Quigley has MAS Curtin at 4% (scarring, nerve) and a Review Panel
+            # at 8% (brain injury, shoulder), which combine to 12.
+            panel = [m for m in certs
+                     if _REVIEW_PANEL_RE.search(str(getattr(m, "assessor", "") or ""))]
+            if rival and panel and len(panel) < len(certs):
+                per_assessor = assessor_totals(panel, False)
+                source = "review panel certificate (supersedes the certificate reviewed)"
+            else:
+                per_assessor, source = assessor_totals(certs, False), "MAS certificate"
         else:
             pool = totals + comps
             if share_one and comps and not totals:
@@ -465,6 +509,7 @@ def resolve_wpi(parsed, *, existing="", nel_status=""):
         if value is None:
             continue
         systems[system] = value
+        systems_out[system] = (_fmt_pct(value), prov, basis)
         bases.append(f"{system}: {basis}")
         if rank(prov) > rank(worst_prov):
             worst_prov = prov
@@ -475,9 +520,21 @@ def resolve_wpi(parsed, *, existing="", nel_status=""):
     # Physical and psychiatric are assessed separately; the higher governs.
     value = max(systems.values())
     basis = "; ".join(bases)
+    # `not determined` where only ONE system was ever quantified: which system
+    # governs is a comparison, and there is nothing to compare against. Naming
+    # the one we hold would assert a finding the decision never made.
+    governing = GoverningSystemEnum.NOT_DETERMINED.value
     if len(systems) > 1:
         winner = max(systems, key=lambda k: systems[k])
         basis += f"; higher of {len(systems)} body systems ({winner})"
+        governing = (GoverningSystemEnum.PSYCHIATRIC.value
+                     if winner == BodySystemEnum.PSYCHIATRIC.value
+                     else GoverningSystemEnum.PHYSICAL.value
+                     if winner == BodySystemEnum.PHYSICAL.value
+                     else GoverningSystemEnum.COMBINED.value)
+    elif set(systems) == {BodySystemEnum.COMBINED.value}:
+        # A single figure the decision itself says covers both systems.
+        governing = GoverningSystemEnum.COMBINED.value
 
     # Threshold sanity check. A statutory recital is not a finding about the
     # claimant, but "the insurer conceded greater than 10%" still CONSTRAINS
@@ -500,10 +557,11 @@ def resolve_wpi(parsed, *, existing="", nel_status=""):
             return row(value, WpiProvenanceEnum.INFERRED.value,
                        f"mean of the {len(above)} assessment(s) above the 10% threshold "
                        f"(lower assessments excluded: impairment found above 10%)",
-                       notes=basis)
+                       notes=basis, governing=governing)
         return row(None, WpiProvenanceEnum.ABSENT.value,
                    f"withheld: {_fmt_pct(value)} contradicts a finding of impairment "
-                   f"above the 10% threshold, and no assessment exceeds it", notes=basis)
+                   f"above the 10% threshold, and no assessment exceeds it",
+                   notes=basis, governing=governing)
 
     if threshold == ThresholdFindingEnum.BELOW.value and value > 10:
         at_or_below = [v for v in all_assessor_values if v <= 10]
@@ -512,11 +570,11 @@ def resolve_wpi(parsed, *, existing="", nel_status=""):
             return row(value, WpiProvenanceEnum.INFERRED.value,
                        f"mean of the {len(at_or_below)} assessment(s) at or below the 10% "
                        f"threshold (higher assessments excluded: impairment found not "
-                       f"above 10%)", notes=basis)
+                       f"above 10%)", notes=basis, governing=governing)
         return row(None, WpiProvenanceEnum.ABSENT.value,
                    f"withheld: {_fmt_pct(value)} contradicts a finding of impairment "
-                   f"not above the 10% threshold", notes=basis)
-    return row(value, worst_prov, basis)
+                   f"not above the 10% threshold", notes=basis, governing=governing)
+    return row(value, worst_prov, basis, governing=governing)
 
 
 # ----------------------------------------------------------------------
@@ -571,6 +629,172 @@ def nel_paid_without_entitlement(*texts):
     return False
 
 
+# ----------------------------------------------------------------------
+# Why a split-WPI figure is missing (round 2 §10.1)
+# ----------------------------------------------------------------------
+
+def _has_mention(mentions, system):
+    """True if the classified mentions hold a usable figure for this body
+    system — i.e. the decision DID quantify it and we failed to carry it."""
+    for m in mentions or ():
+        if str(m.get("body_system") or "") != system:
+            continue
+        if not m.get("about_claimant", True) or m.get("superseded"):
+            continue
+        if str(m.get("kind") or "") in (WpiKindEnum.THRESHOLD_RECITAL.value,
+                                        WpiKindEnum.CLAIMED_OR_REJECTED.value,
+                                        WpiKindEnum.OTHER.value):
+            continue
+        if to_pct(m.get("value")) is not None:
+            return True
+    return False
+
+
+def classify_split_wpi_absence(*, system, has_psychiatric, total_present,
+                               mentions=(), psychiatric_only=False):
+    """Why is `WPI {system} %` empty? Returns a WpiProvenanceEnum string.
+
+    Deterministic — no model call. The four states are decidable from columns
+    the row already carries, which is the whole point of §10.1: applicability
+    becomes a lookup rather than an inference from a flag and a threshold.
+
+      not_applicable  the body system does not arise for this claimant
+      absent          the decision quantified it and we did not capture it
+      not_stated      it was assessed, but not given as a separate figure
+      not_assessed    nobody quantified it at all
+
+    The two systems are NOT symmetric, because the columns are not. A
+    psychiatric percentage is separately stated by its nature, so a psychiatric
+    assessment in the text with an empty column is a defect. The physical
+    column is defined as "only if the decision states physical and psychiatric
+    SEPARATELY", so physical figures on a decision that never quantified
+    psychiatric are `not_stated`, not a miss — there was no split to capture.
+    Reading that asymmetry the other way put 91 rows in `absent` that were
+    behaving exactly as specified.
+    """
+    if system == BodySystemEnum.PSYCHIATRIC.value and not has_psychiatric:
+        return WpiProvenanceEnum.NOT_APPLICABLE.value
+    if system == BodySystemEnum.PHYSICAL.value and psychiatric_only:
+        return WpiProvenanceEnum.NOT_APPLICABLE.value
+
+    mine = _has_mention(mentions, system)
+    if system == BodySystemEnum.PHYSICAL.value:
+        # A split only existed if the counterpart was quantified too.
+        split_existed = mine and _has_mention(
+            mentions, BodySystemEnum.PSYCHIATRIC.value)
+    else:
+        split_existed = mine
+    if split_existed:
+        return WpiProvenanceEnum.ABSENT.value
+
+    # `not_stated` claims an assessment happened, so it needs a USABLE figure
+    # somewhere. A decision whose only percentage is the statutory 10% recital
+    # has assessed nothing, and counting it would relabel 'nobody measured
+    # this' as 'measured but not broken down'.
+    if total_present or any(
+            _has_mention(mentions, s.value) for s in BodySystemEnum):
+        return WpiProvenanceEnum.NOT_STATED.value
+    return WpiProvenanceEnum.NOT_ASSESSED.value
+
+
+# ----------------------------------------------------------------------
+# Which body system governs (round 2 §10.4 rule 1)
+# ----------------------------------------------------------------------
+
+class GoverningSystemEnum(str, Enum):
+    """Which assessment the WPI figure is taken from.
+
+    Physical and psychiatric impairment are assessed SEPARATELY under the Motor
+    Accident Guidelines and are not combined with each other, so where both are
+    stated the GREATER governs the s 4.11 question. `resolve_wpi` already
+    computes this ("higher of 2 body systems (psychiatric)"); this promotes it
+    from prose in `WPI Resolution Notes` to a column the consumer can filter on.
+    """
+    PHYSICAL = "physical"
+    PSYCHIATRIC = "psychiatric"
+    COMBINED = "combined"          # one figure expressly covering both
+    NOT_DETERMINED = "not determined"   # only one system was ever quantified
+    NOT_STATED = "not stated"           # neither system was quantified
+
+
+def governing_system(physical, psychiatric, total=None):
+    """Which system the governing WPI comes from, from the split components.
+
+    `total` disambiguates the case where the components tie, and catches the
+    row whose stated total matches neither component — which means the total
+    was combined across systems rather than selected between them.
+    """
+    p, q = to_pct(physical), to_pct(psychiatric)
+    if p is None and q is None:
+        return GoverningSystemEnum.NOT_STATED.value
+    if p is None or q is None:
+        # Round 5 §13. Which system governs is a COMPARISON, so one component
+        # cannot answer it. Returning the captured one made the column a
+        # tautology — "the system we happen to hold is the system that governs"
+        # — on 145 rows, and it was demonstrably wrong wherever the missing
+        # component was the larger. Row 7: total 12, psychiatric 1, physical
+        # uncaptured; the label read `psychiatric` while the resolution's own
+        # notes said `higher of 2 body systems (physical)`.
+        return GoverningSystemEnum.NOT_DETERMINED.value
+
+    t = to_pct(total)
+    if t is not None and t > max(p, q):
+        # Neither component alone reaches the stated total, so the assessor
+        # combined across systems (Mason [2024] NSWPIC 348: 7% shoulder + 6%
+        # emotional/behavioural within ONE brain-injury assessment = 13%).
+        return GoverningSystemEnum.COMBINED.value
+    if q > p:
+        return GoverningSystemEnum.PSYCHIATRIC.value
+    if p > q:
+        return GoverningSystemEnum.PHYSICAL.value
+    return GoverningSystemEnum.COMBINED.value if t is None or t == p else (
+        GoverningSystemEnum.PHYSICAL.value)
+
+
+# ----------------------------------------------------------------------
+# Non-economic loss vs the threshold (round 2 §10.4 rule 2)
+# ----------------------------------------------------------------------
+
+class NelConsistencyEnum(str, Enum):
+    """Does the award of non-economic loss agree with the impairment finding?
+
+    s 4.11 gates non-economic loss on impairment ABOVE 10%; economic loss has
+    no such threshold. Where the two disagree, either the head is misclassified
+    (a buffer, or a Compensation to Relatives award, booked as non-economic
+    loss) or the finding is misattributed — or, occasionally, the insurer paid
+    what it did not owe and the Member approved it.
+
+    This column reports the disagreement; it does not resolve it. Nothing is
+    edited on the strength of it.
+    """
+    YES = "yes"
+    NO = "no"
+    UNKNOWN = "cannot determine"
+
+
+def nel_threshold_consistency(*, nel_status, threshold_finding, wpi):
+    """Compare the non-economic loss award against the threshold evidence.
+
+    The explicit `WPI Threshold Finding` outranks any percentage, because
+    physical and psychiatric are assessed separately and the greater governs —
+    so a `WPI %` holding one body system cannot be compared to 10 directly.
+    """
+    if str(nel_status or "").strip() != "Awarded":
+        return NelConsistencyEnum.UNKNOWN.value
+
+    finding = str(threshold_finding or "").strip()
+    if finding == ThresholdFindingEnum.ABOVE.value:
+        return NelConsistencyEnum.YES.value
+    if finding == ThresholdFindingEnum.BELOW.value:
+        return NelConsistencyEnum.NO.value
+
+    value = to_pct(wpi)
+    if value is None:
+        return NelConsistencyEnum.UNKNOWN.value
+    return (NelConsistencyEnum.YES.value if value > 10
+            else NelConsistencyEnum.NO.value)
+
+
 # Flat columns contributed by this module.
 WPI_FIELDS = [
     "WPI Provenance",
@@ -578,17 +802,72 @@ WPI_FIELDS = [
     "WPI Basis",
     "WPI Candidates",
     "WPI Resolution Notes",
+    # --- round 2 ---
+    "WPI Governing System",         # §10.4 rule 1
+    "NEL Threshold Consistent",     # §10.4 rule 2
+    "WPI Threshold Finding Basis",  # §10.3
 ]
+
+
+class ThresholdBasisEnum(str, Enum):
+    """Where `WPI Threshold Finding` came from.
+
+    §10.3 asked for coverage well above 38.7% while keeping `not determined`
+    distinct from empty. Coverage can be raised because s 4.11 makes some
+    findings deducible — an award of non-economic loss is only lawful above
+    10%, so the award itself settles the threshold. But a deduction is not a
+    finding the court made, and the consumer's own rule is that an explicit
+    finding outranks anything computed. So the finding is filled and this
+    column says how, letting a consumer that wants only judicial findings
+    filter to `decision`.
+    """
+    DECISION = "decision"
+    FROM_NEL_AWARD = "implied by non-economic loss award"
+    FROM_WPI = "implied by stated WPI"
+    NONE = "not determined"
+
+
+def derive_threshold_finding(*, nel_status, wpi, ex_gratia=False):
+    """Deduce the s 4.11 threshold where the decision did not state it.
+
+    Returns (finding, basis). Only two deductions are safe:
+
+      * non-economic loss was awarded, which s 4.11 permits only above 10% —
+        unless the insurer paid without any obligation to, which is the one
+        way a lawful award can sit below the threshold; and
+      * a stated whole-person impairment, compared to 10 directly.
+
+    Nothing is deduced from a `Nil` award: a head can be refused for many
+    reasons besides the threshold, and guessing which would manufacture a
+    judicial finding out of silence.
+    """
+    if str(nel_status or "").strip() == "Awarded" and not ex_gratia:
+        return ThresholdFindingEnum.ABOVE.value, ThresholdBasisEnum.FROM_NEL_AWARD.value
+
+    value = to_pct(wpi)
+    if value is not None:
+        finding = (ThresholdFindingEnum.ABOVE.value if value > 10
+                   else ThresholdFindingEnum.BELOW.value)
+        return finding, ThresholdBasisEnum.FROM_WPI.value
+
+    return ThresholdFindingEnum.NONE.value, ThresholdBasisEnum.NONE.value
 
 
 def empty_wpi_row(existing_value=""):
     """Defaults for a row the resolution pass has not seen. Provenance follows
-    the value that is already there, so a pre-existing WPI is not mislabelled."""
+    the value that is already there, so a pre-existing WPI is not mislabelled.
+
+    An unseen row's absence is `not_assessed`, not `absent`: we have no evidence
+    the decision quantified anything, and `absent` now means "it was there and
+    we missed it", which is a claim this default cannot support."""
     return {
         "WPI Provenance": (WpiProvenanceEnum.STATED.value if str(existing_value or "").strip()
-                           else WpiProvenanceEnum.ABSENT.value),
+                           else WpiProvenanceEnum.NOT_ASSESSED.value),
         "WPI Threshold Finding": ThresholdFindingEnum.NONE.value,
         "WPI Basis": "",
         "WPI Candidates": "",
         "WPI Resolution Notes": "",
+        "WPI Governing System": GoverningSystemEnum.NOT_STATED.value,
+        "NEL Threshold Consistent": NelConsistencyEnum.UNKNOWN.value,
+        "WPI Threshold Finding Basis": ThresholdBasisEnum.NONE.value,
     }

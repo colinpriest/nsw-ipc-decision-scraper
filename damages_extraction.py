@@ -68,13 +68,54 @@ RECONCILE_TOLERANCE = float(os.getenv("NSW_DAMAGES_TOLERANCE", "1000"))
 # ----------------------------------------------------------------------
 
 class ProvenanceEnum(str, Enum):
-    """How a money figure was obtained. The consumer excludes or down-weights
-    `inferred`, so the distinction has to be honest: `stated` means the figure
-    is in the decision, `derived` means we did arithmetic on figures that are."""
+    """How a figure was obtained, and — when there is none — WHY there is none.
+
+    The consumer excludes or down-weights `inferred`, so the positive values
+    have to be honest: `stated` means the figure is in the decision, `derived`
+    means we did arithmetic on figures that are.
+
+    The negative values matter just as much, and used to be one word. Reporting
+    every empty cell as `absent` made "the answer is no" indistinguishable from
+    "we do not know", which turned a missingness check into a choice between
+    flagging 448 psychiatric-WPI blanks or none of them. Of those 448, exactly
+    one is a defect. So the absence is now classified:
+
+      not_applicable - the precondition does not arise. No psychiatric injury,
+                       so no psychiatric WPI to assess. Not a gap.
+      not_assessed   - the precondition arises but nobody quantified it: no MAS
+                       certificate, or the head was never put in issue.
+      not_stated     - it WAS assessed, but the decision does not give the
+                       number (typically a combined total with no body-system
+                       split).
+      absent         - it should have been recoverable from this text and we
+                       did not get it. **This one is a defect.**
+
+    Only `absent` should ever fail a data-quality check. A consumer testing
+    `== 'absent'` today keeps working and gets exactly the defect case, which
+    is what that test always meant.
+    """
     STATED = "stated"
     DERIVED = "derived"
     INFERRED = "inferred"
+    NOT_APPLICABLE = "not_applicable"
+    NOT_ASSESSED = "not_assessed"
+    NOT_STATED = "not_stated"
     ABSENT = "absent"
+
+
+# The values that are not a defect — everything except ABSENT. Use this rather
+# than enumerating, so a future value is not silently treated as a failure.
+PROVENANCE_NON_DEFECT = frozenset({
+    ProvenanceEnum.STATED.value, ProvenanceEnum.DERIVED.value,
+    ProvenanceEnum.INFERRED.value, ProvenanceEnum.NOT_APPLICABLE.value,
+    ProvenanceEnum.NOT_ASSESSED.value, ProvenanceEnum.NOT_STATED.value,
+})
+
+# The values that record an absence rather than a figure.
+PROVENANCE_ABSENCE = frozenset({
+    ProvenanceEnum.NOT_APPLICABLE.value, ProvenanceEnum.NOT_ASSESSED.value,
+    ProvenanceEnum.NOT_STATED.value, ProvenanceEnum.ABSENT.value,
+})
 
 
 class HeadStatusEnum(str, Enum):
@@ -215,6 +256,14 @@ class DamagesSchema(BaseModel):
         "Short free text listing what other_damages_heads covers, e.g. "
         "'interest 12,430; out-of-pockets 3,110'. EMPTY if none."
     ))
+    other_damages_heads_status: HeadStatusEnum = Field(description=(
+        "The three-valued disposition of the OTHER heads taken together, on "
+        "the same convention as the named heads. 'Awarded' if any other head "
+        "was allowed; 'Nil' if other heads were claimed or considered and "
+        "nothing was allowed for them; 'Not addressed' if no other head was "
+        "ever in issue — which is the ordinary case, and is NOT a zero. "
+        "Answer this even when you cannot put a figure on the amount."
+    ))
 
     # ---- Gross vs net ----
     total_damages_gross: MoneyField = Field(description=(
@@ -248,6 +297,9 @@ class DamagesSchema(BaseModel):
         "The deduction for statutory benefits already paid — the insurer's "
         "entitlement to deduct under s 3.40 of the Motor Accident Injuries Act "
         "2017, or an equivalent repayment/credit taken out of the settlement. "
+        "For an accident under the PREDECESSOR scheme this is the s 130 credit "
+        "under the Motor Accidents Compensation Act 1999 (MACA) for payments "
+        "made under s 83 — the same concept in different words. "
         "EMPTY if none."
     ))
     other_deductions: MoneyField = Field(description=(
@@ -267,7 +319,16 @@ class DamagesSchema(BaseModel):
         "Total statutory benefits PAID to date (weekly payments plus treatment "
         "and care), where the decision quantifies them. Under MAIA 2017 these "
         "are statutory benefits, NOT damages — they sit outside the damages "
-        "reconciliation. EMPTY if not quantified."
+        "reconciliation. Under the predecessor MACA 1999 scheme the equivalent "
+        "is the total of the insurer's s 83 payments; 'Section 83 payments "
+        "$12,369' states this field. "
+        "This is NOT the same as statutory_benefits_repaid: PAID is everything "
+        "the claimant received, while REPAID is the deduction, which reaches "
+        "only the recoverable categories. They are usually equal and differ "
+        "exactly when there is a treatment-and-care component, which is the "
+        "case this field is most useful for — so NEVER copy one into the "
+        "other. A figure stated only as the amount deducted is the repayment; "
+        "leave this field EMPTY unless the decision states an amount PAID."
     ))
     treatment_and_care_paid: MoneyField = Field(description=(
         "Treatment and care expenses paid or ordered, where quantified. EMPTY "
@@ -442,6 +503,12 @@ _DAMAGES_KEYWORDS = (
     "loss of earning capacity", "buffer", "gratuitous", "griffiths",
     "total damages", "damages are assessed", "assessed at", "settlement sum",
     "s 3.40", "section 3.40", "statutory benefits", "entitled to deduct",
+    # MACA 1999 says the same things in different words, and a decision that
+    # uses only those words had its quantum section trimmed out of the context
+    # window before it ever reached the model — which is why MACA-era language
+    # was 11x enriched among the statutory-benefits failures (round 4 §12.3).
+    "s 83", "section 83", "s 130", "section 130", "maca",
+    "motor accidents compensation act",
     "contributory negligence", "medicare", "centrelink", "151z",
     "orders", "determination", "i determine", "i assess", "interest",
     "superannuation", "out of pocket", "treatment and care",
@@ -589,11 +656,15 @@ def _drop_zero(amount, provenance):
 def apply_head_status(amount, provenance, status, *, fatality=False):
     """Enforce the status/amount contract (spec acceptance criterion 4).
 
-    - 'Not addressed'  -> amount null, provenance 'absent'
+    - 'Not addressed'  -> amount null, provenance 'not_assessed' — the head was
+                          never in issue. On a fatality/dependency claim it is
+                          'not_applicable' instead: an ordinary head cannot
+                          arise on that pathway at all.
     - 'Nil'            -> amount 0, provenance kept ('absent' becomes 'derived',
                           since the zero follows from the refusal finding)
     - 'Awarded'        -> amount kept; an awarded head with no amount is a
-                          contradiction and is reported as an issue.
+                          contradiction, stays 'absent' (the defect value) and
+                          is reported as an issue.
 
     A fatality/dependency claim never carries an ordinary head, so 'Nil' is
     rewritten to 'Not addressed' (spec 5.5).
@@ -610,7 +681,12 @@ def apply_head_status(amount, provenance, status, *, fatality=False):
     if status == HeadStatusEnum.NOT_ADDRESSED.value:
         if amount not in ("", None):
             issues.append(f"Not addressed head carried amount {amount}; dropped")
-        return "", ProvenanceEnum.ABSENT.value, status, issues
+        # Round 2 §10.1: distinguish "cannot arise" from "was never put in
+        # issue". The consumer files "the head was never in issue" under
+        # not_assessed; only the fatality pathway is a true not_applicable.
+        prov = (ProvenanceEnum.NOT_APPLICABLE.value if fatality
+                else ProvenanceEnum.NOT_ASSESSED.value)
+        return "", prov, status, issues
 
     if status == HeadStatusEnum.NIL.value:
         if amount not in ("", None, "0", "0.0") and to_float(amount):
@@ -680,6 +756,15 @@ def normalise_damages(parsed, *, existing=None):
 
     buffer_amt, buffer_prov, quotes["buffer_amount"] = _money_of(getattr(parsed, "buffer_amount", None))
     other_amt, other_prov, quotes["other_damages_heads"] = _money_of(getattr(parsed, "other_damages_heads", None))
+    # §11.1: the only money head that shipped without a Status companion, so a
+    # considered-and-refused other head and one never in issue both collapsed
+    # to null — and 71% of the column read as missing data when the values are
+    # zeros. `Not addressed` is the default: no other head in issue is the
+    # ordinary case for a CTP damages determination.
+    other_amt, other_prov, other_status, other_issues = apply_head_status(
+        other_amt, other_prov, getattr(parsed, "other_damages_heads_status", None),
+        fatality=fatality)
+    issues.extend(f"other_damages_heads: {m}" for m in other_issues)
 
     cn_pct, cn_pct_prov, quotes["contributory_negligence_percent"] = _money_of(
         getattr(parsed, "contributory_negligence_percent", None))
@@ -849,6 +934,7 @@ def normalise_damages(parsed, *, existing=None):
         "Buffer Amount": buffer_amt,
         "Buffer Basis": (getattr(parsed, "buffer_basis", "") or "").strip(),
         "Other Damages Heads": other_amt,
+        "Other Damages Heads Status": other_status,
         "Other Damages Heads Basis": (getattr(parsed, "other_damages_heads_basis", "") or "").strip(),
         # --- independent re-extraction of the two trusted heads (criterion 2) ---
         "Non-Economic Loss (Recheck)": nel,
@@ -946,7 +1032,7 @@ DAMAGES_FIELDS = [
     "Statutory Benefits Repaid", "Other Deductions", "Deductions Basis",
     "Total Damages Gross", "Lump Sum Basis",
     "Buffer Amount", "Buffer Basis",
-    "Other Damages Heads", "Other Damages Heads Basis",
+    "Other Damages Heads", "Other Damages Heads Status", "Other Damages Heads Basis",
     "Non-Economic Loss (Recheck)", "Non-Economic Loss Status (Recheck)",
     "Future Economic Loss (Recheck)", "Future Economic Loss Status (Recheck)",
     "Net Sum Payable", "Net Sum Payable Provenance",
@@ -991,6 +1077,254 @@ DAMAGES_NUMERIC_FIELDS = [
 ]
 
 # Money fields that must carry a provenance value (acceptance criterion 5).
+# ----------------------------------------------------------------------
+# Why a money figure is missing (round 3 §11)
+# ----------------------------------------------------------------------
+#
+# Round 2 refined the WPI columns and left the money columns on bare `absent`,
+# which meant "FAIL on absent" could not be turned on for them: it would have
+# reported 539 rows of `Weekly Statutory Benefit` as extraction failures when
+# a damages determination has no reason to quantify a statutory benefit at all.
+#
+# Every rule below is decided from columns the row already carries. The
+# classification a column gets depends on what its blank MEANS, and the columns
+# fall into four kinds:
+#
+#   HEAD          a damages head with a Status companion. Status decides:
+#                 `Not addressed` -> not_applicable (never in issue),
+#                 `Awarded` with no amount -> not_stated (allowed but never
+#                 quantified — a global settlement figure, or economic loss
+#                 assessed as an undifferentiated buffer).
+#   EVENT         records something that either happened or did not: a buffer,
+#                 a deduction, a contributory-negligence finding. Blank means
+#                 it did not happen, so not_applicable.
+#   STATUTORY     a statutory-benefit figure. Under MAIA these are a different
+#                 scheme from damages, so a damages determination that does not
+#                 quantify one is not_applicable, not deficient.
+#   ALWAYS        applies to every award, so blank is never not_applicable —
+#                 `Net Sum Payable` exists for every matter whether or not the
+#                 decision states it.
+MONEY_ABSENCE_KIND = {
+    "Non-Economic Loss": "HEAD",
+    "Past Economic Loss": "HEAD",
+    "Future Economic Loss": "HEAD",
+    "Other Damages Heads": "HEAD",
+    "Buffer Amount": "EVENT",
+    "Other Deductions": "EVENT",
+    "Contributory Negligence Percent": "EVENT",
+    "Contributory Negligence Amount": "EVENT",
+    "Statutory Benefits Repaid": "EVENT",
+    "Statutory Benefits Paid": "STATUTORY",
+    "Treatment And Care Paid": "STATUTORY",
+    "Weekly Statutory Benefit": "STATUTORY",
+    "Net Sum Payable": "ALWAYS",
+    "Lump Sum": "ALWAYS",
+    "Total Damages Gross": "ALWAYS",
+}
+
+
+def classify_money_absence(column, *, status=None, corroborated=False,
+                           precondition_arises=False):
+    """Why is `column` empty? Returns a ProvenanceEnum string.
+
+    `status` is the paired `<head> Status` where one exists. `corroborated`
+    means something else on the row shows the figure DID exist — money was
+    repaid so benefits must have been paid, or the accounting identity leaves a
+    hole only this column can fill. That is the only route to `absent`, which
+    is the one value meaning a defect.
+    """
+    # Corroboration is positive evidence that the figure exists in the text,
+    # so it outranks every other signal including the head status — a head
+    # recorded as never in issue that nonetheless leaves a five-figure hole in
+    # the accounting identity is a miss, not an inapplicable column.
+    if corroborated:
+        return ProvenanceEnum.ABSENT.value
+
+    kind = MONEY_ABSENCE_KIND.get(column, "ALWAYS")
+    if kind == "HEAD":
+        status = _enum_value(status, "") if status is not None else ""
+        if status == HeadStatusEnum.NOT_ADDRESSED.value:
+            return ProvenanceEnum.NOT_APPLICABLE.value
+        # `Awarded` with no amount, or no status at all: allowed but never
+        # quantified. `Nil` should already carry 0 and is repaired by the caller.
+        return ProvenanceEnum.NOT_STATED.value
+
+    if kind in ("EVENT", "STATUTORY"):
+        # A recorded s 3.40 / s 130 repayment proves benefits WERE paid, so the
+        # precondition plainly arises and the decision has simply not put a
+        # total on it. Round 4 §12.2: that is `not_stated`, and calling it
+        # `not_applicable` would deny a fact the row itself records.
+        return (ProvenanceEnum.NOT_STATED.value if precondition_arises
+                else ProvenanceEnum.NOT_APPLICABLE.value)
+    return ProvenanceEnum.NOT_STATED.value
+
+
+_RESIDUAL_HEADS = ("Non-Economic Loss", "Past Economic Loss", "Future Economic Loss")
+
+# An ITEMISED other head, with a figure attached. Round 6 §14.3 asks that
+# `Other Damages Heads` reach `absent` only where such a head is visibly in the
+# decision and was not captured — a residual on its own does not identify WHICH
+# column is wrong, and on the real rows it usually indicts a different one:
+# "leaving $100,000 for future economic loss" is an uncaptured FEL, and
+# "a 30% reduction for contributory negligence" is a head holding the net.
+_ITEMISED_OTHER_HEAD = re.compile(
+    r"(?:superannuation|Fox\s+v\s+Wood|gratuitous|Griffiths|domestic assistance|"
+    r"out[- ]of[- ]pocket|interest)[^.]{0,60}\$\s?[\d,]+"
+    r"|\$\s?[\d,]+[^.]{0,40}(?:superannuation|Fox\s+v\s+Wood|gratuitous|"
+    r"Griffiths|domestic assistance|out[- ]of[- ]pocket|interest)", re.I)
+
+
+def has_itemised_other_head(*texts):
+    """True if a text itemises an other head WITH a figure."""
+    return any(_ITEMISED_OTHER_HEAD.search(str(t)) for t in texts if t)
+
+
+def damages_residual(row):
+    """`Total Damages Gross` less the three named heads. Returns
+    (residual, trustworthy).
+
+    Trustworthy means the arithmetic can carry weight: the gross is `stated`
+    rather than itself derived from the heads — otherwise the identity closes
+    by construction — and every named head is either quantified or explicitly
+    disposed of as `Nil` / `Not addressed`. A head that is merely unknown makes
+    the residual unattributable, which is exactly the limitation that stops
+    this from being a way to manufacture zeros.
+    """
+    gross = to_float(row.get("Total Damages Gross"))
+    if gross is None:
+        return None, False
+    trustworthy = str(row.get("Total Damages Gross Provenance") or "") == "stated"
+
+    total = 0.0
+    for head in _RESIDUAL_HEADS:
+        value = to_float(row.get(head))
+        if value is not None:
+            total += value
+            continue
+        status = _enum_value(row.get(f"{head} Status"), "")
+        if status not in (HeadStatusEnum.NIL.value, HeadStatusEnum.NOT_ADDRESSED.value):
+            trustworthy = False
+    return gross - total, trustworthy
+
+
+def refine_money_absence(row, *, residual=None, residual_trustworthy=False):
+    """Give every empty money cell a reason instead of a bare `absent`.
+
+    Mutates in place. Deterministic and idempotent: it only ever rewrites a
+    provenance that is currently an absence value, never a `stated`, `derived`
+    or `inferred` one, so it can be replayed after any later pass.
+
+    `residual` is `Total Damages Gross - (NEL + past EL + future EL)` and is
+    what decides `Other Damages Heads`: where the identity closes, the blank is
+    a genuine zero; where it leaves a hole bigger than the reconciliation
+    tolerance, a real head was awarded and not captured.
+    """
+    status_of = {a: s for s, a in STATUS_AMOUNT_PAIRS}
+
+    # How many of the named heads carry a figure. Zero, on a decision that
+    # states a gross, means the award was never apportioned between heads —
+    # "The parties agreed total damages at $1,900,000 ... The decision did not
+    # apportion the $1,900,000 between heads of damage" (Taaga). The whole
+    # gross then shows up as residual, which says nothing about other heads.
+    heads_total = sum(to_float(row.get(h)) or 0.0 for h in _RESIDUAL_HEADS)
+    gross_value = to_float(row.get("Total Damages Gross"))
+    # A `Nil` head is quantified but absorbs nothing, so counting populated
+    # cells would miss "settlement of $165,000 ... the decision did not
+    # apportion it and found no entitlement to non-economic loss" (Javed).
+    # What matters is whether ANY of the gross was allocated.
+    unapportioned = bool(gross_value) and heads_total == 0
+
+    # A residual equal to the contributory-negligence reduction means a named
+    # head was populated with the NET figure, not the gross — Pantelis: "non-
+    # economic loss of $275,000. Contributory negligence of 20% reduced damages
+    # by $55,000", with $220,000 recorded. That is a defect in the NAMED head,
+    # so it must not be laundered into a claim about other heads.
+    cn_amount = to_float(row.get("Contributory Negligence Amount"))
+    net_for_gross = (residual is not None and cn_amount is not None
+                     and abs(abs(residual) - cn_amount) <= RECONCILE_TOLERANCE)
+    if net_for_gross:
+        note = (f"a named head appears to hold the net figure: residual "
+                f"{abs(residual):,.0f} equals the contributory-negligence "
+                f"reduction")
+        row["Damages Notes"] = "; ".join(
+            x for x in [row.get("Damages Notes", ""), note] if x)[:1000]
+
+    for amount_col, prov_col in MONEY_PROVENANCE_PAIRS:
+        prov = str(row.get(prov_col) or "").strip()
+        amount = str(row.get(amount_col) or "").strip()
+        status_col = status_of.get(amount_col)
+        status = row.get(status_col) if status_col else None
+
+        # A head added without a Status companion needs one even where the
+        # amount IS present, or the column is populated only on its blanks.
+        if status_col and amount and not str(row.get(status_col) or "").strip():
+            row[status_col] = (HeadStatusEnum.NIL.value if to_float(amount) == 0
+                               else HeadStatusEnum.AWARDED.value)
+            status = row[status_col]
+
+        if prov and prov not in PROVENANCE_ABSENCE:
+            continue                       # a real figure; leave it alone
+
+        # A `Nil` head is a genuine zero, not an absence. Repair the pairing
+        # rather than classifying a contradiction.
+        if status and _enum_value(status, "") == HeadStatusEnum.NIL.value:
+            if not amount or to_float(amount) == 0:
+                row[amount_col] = "0"
+                row[prov_col] = ProvenanceEnum.DERIVED.value
+                continue
+
+        if amount:
+            row[prov_col] = ProvenanceEnum.STATED.value
+            if status_col and not str(row.get(status_col) or "").strip():
+                row[status_col] = (HeadStatusEnum.NIL.value if to_float(amount) == 0
+                                   else HeadStatusEnum.AWARDED.value)
+            continue
+
+        corroborated = False
+        precondition_arises = False
+        if amount_col == "Other Damages Heads":
+            if residual_trustworthy and residual is not None:
+                if abs(residual) <= RECONCILE_TOLERANCE:
+                    # The identity closes without it: there IS no other head.
+                    row["Other Damages Heads"] = "0"
+                    row[prov_col] = ProvenanceEnum.DERIVED.value
+                    if status_col and not str(row.get(status_col) or "").strip():
+                        row[status_col] = HeadStatusEnum.NIL.value
+                    continue
+                if (abs(residual) > 10 * RECONCILE_TOLERANCE
+                        and not unapportioned and not net_for_gross
+                        and has_itemised_other_head(row.get("Award Breakdown"),
+                                                    row.get("Other Damages Heads Basis"))):
+                    # A five-figure hole only this column can fill: the
+                    # decision DID apportion, the named heads are accounted
+                    # for, and what is left over is a head we did not capture.
+                    corroborated = True
+        elif amount_col == "Statutory Benefits Paid":
+            # Round 4 §12.2 corrected this. A stated repayment proves benefits
+            # WERE paid, but not that the decision quantifies the total paid —
+            # and those are different amounts whenever there is a treatment-and-
+            # care component, which is exactly what this field is for. On all
+            # 62 rows that reached `absent` this way, the decision described a
+            # s 3.40 deduction and no separate paid total, so the honest value
+            # is `not_stated`. A figure that IS stated is recovered by
+            # `statutory_benefits_recovery` and never reaches here.
+            corroborated = False
+            precondition_arises = str(
+                row.get("Statutory Benefits Repaid Provenance") or "") in ("stated", "derived")
+
+        prov = classify_money_absence(
+            amount_col, status=status, corroborated=corroborated,
+            precondition_arises=precondition_arises)
+        # On an unapportioned award every head WAS allowed, just never broken
+        # out, so `not_applicable` would misreport a head that is genuinely in
+        # issue. This is the distinction a downstream `fel_applies` gate needs.
+        if unapportioned and amount_col in _RESIDUAL_HEADS \
+                and prov == ProvenanceEnum.NOT_APPLICABLE.value:
+            prov = ProvenanceEnum.NOT_STATED.value
+        row[prov_col] = prov
+    return row
+
+
 MONEY_PROVENANCE_PAIRS = [
     ("Lump Sum", "Lump Sum Provenance"),
     ("Net Sum Payable", "Net Sum Payable Provenance"),
@@ -1014,6 +1348,7 @@ STATUS_AMOUNT_PAIRS = [
     ("Past Economic Loss Status", "Past Economic Loss"),
     ("Non-Economic Loss Status", "Non-Economic Loss"),
     ("Future Economic Loss Status", "Future Economic Loss"),
+    ("Other Damages Heads Status", "Other Damages Heads"),
     ("Non-Economic Loss Status (Recheck)", "Non-Economic Loss (Recheck)"),
     ("Future Economic Loss Status (Recheck)", "Future Economic Loss (Recheck)"),
 ]

@@ -256,7 +256,10 @@ def test_merge_fills_and_records_provenance():
 
 def test_blank_record_defaults():
     row = ns.build_result_record("Case", "http://example/1")
-    assert row["WPI Provenance"] == "absent"
+    # Round 2 §10.1: a row the pass never examined is `not_assessed`, not
+    # `absent`. `absent` now asserts the decision HAD the figure and we lost
+    # it, which a default has no evidence for.
+    assert row["WPI Provenance"] == "not_assessed"
     assert row["WPI Basis"] == ""
 
 
@@ -596,11 +599,18 @@ def test_bond_is_caught_even_though_the_threshold_was_never_determined():
     assert row["_wpi_quarantined"]
 
 
-def test_silcocks_ex_gratia_payment_is_kept_because_the_data_is_correct():
+def test_silcocks_ex_gratia_payment_withholds_the_wpi_as_not_applicable():
     """[2023] NSWPIC 24. 9% WPI, no entitlement, and $120,000 approved anyway
     as a compromise "where no legal obligation on insurer to make any allowance
-    for non-economic loss". Blanking this WPI would destroy the one figure in
-    the row that is right."""
+    for non-economic loss".
+
+    The 9% is correct, and it is still withheld (operator decision,
+    2026-08-07): publishing it makes every downstream s 4.11 check read the row
+    as an impossible combination, because a checker comparing WPI to 10 cannot
+    see that the payment was never made under s 4.11 at all. The distinction
+    from a quarantined row is the PROVENANCE — `not_applicable`, the threshold
+    question does not arise, rather than `absent`, which claims a defect. The
+    figure is preserved in `WPI % Candidates` either way."""
     row = ns.build_result_record("QBE v Silcocks", "http://x/24",
                                  status="ok", **{"Decision Date": "2023-01-20"})
     row.update({
@@ -615,8 +625,10 @@ def test_silcocks_ex_gratia_payment_is_kept_because_the_data_is_correct():
             "having regard to serious injury sustained and where no legal "
             "obligation on insurer to make any allowance for non-economic loss"),
     })
-    assert ns.quarantine_impossible_wpi(row) is False
-    assert row["Impairment % (Accepted)"] == "9"
+    assert ns.quarantine_impossible_wpi(row) is False   # not a defect
+    assert row["Impairment % (Accepted)"] == ""
+    assert row["WPI Candidates"] == "9"
+    assert row["WPI Provenance"] == "not_applicable"
     assert row.get("_wpi_quarantined") in (None, "")
     assert row["_wpi_ex_gratia"] is True
     assert "without any legal" in row["WPI Resolution Notes"]

@@ -79,6 +79,7 @@ def main():
         cache = json.load(f)
 
     quarantined, spared = [], []
+    changed = 0
     for url, row in candidate_rows(cache):
         name = (row.get("Case Name") or url).split("[")[0].strip()[:50]
         wpi = str(row.get("Impairment % (Accepted)") or "").strip()
@@ -90,6 +91,11 @@ def main():
             continue
         (quarantined if quarantine_impossible_wpi(row) else spared).append(
             (name, wpi, nel))
+        # The ex gratia path withholds the WPI too but is not a quarantine, so
+        # it returns False. Detect the mutation rather than the return value,
+        # or that row is decided and then never written.
+        if str(row.get("Impairment % (Accepted)") or "").strip() != wpi:
+            changed += 1
 
     print(f"{len(quarantined) + len(spared)} row(s) award non-economic loss on a "
           f"WPI at or below 10%.\n")
@@ -106,9 +112,10 @@ def main():
     if args.dry_run:
         print("\n--dry-run: nothing written.")
         return 0
-    if not quarantined:
-        print("\nNothing to withhold; cache unchanged.")
+    if not changed:
+        print("\nNo WPI value changed; cache unchanged.")
         return 0
+    print(f"\n{changed} WPI value(s) withheld.")
 
     with dataset_lock():
         atomic_write_json(CACHE_FILE, cache)
