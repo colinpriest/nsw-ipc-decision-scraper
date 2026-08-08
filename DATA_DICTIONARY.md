@@ -101,12 +101,12 @@ All money is AUD as a bare number — no `$`, no thousands separators. Dates are
 |---|---|---|---|
 | `Lump Sum` | number | 100% | **This is the GROSS sum, not net — see §5.** |
 | `WPI %` | number | **59.3%** | The WPI the award is calibrated against (accepted, whether assessed here or in a prior MAS certificate). Blank where the decision does not state one, and blank where the row's own award of non-economic loss proves the captured figure wrong — see §3.1 |
-| `WPI % Provenance` | enum | 100% | `stated` 309 · `not_assessed` 213 · `inferred` 9 · `absent` 5 · `derived` 2 · `not_stated` 1 · `not_applicable` 1. **`absent` now means a defect** — see Conventions. **Exclude `inferred` for WPI-conditional analysis** — those are central estimates of competing assessments, not figures the decision states |
+| `WPI % Provenance` | enum | 100% | `stated` 309 · `not_assessed` 207 · `not_stated` 12 · `inferred` 9 · `derived` 2 · `not_applicable` 1. **`absent` means a defect, and is now empty across the workbook** — see Conventions. **Exclude `inferred` for WPI-conditional analysis** — those are central estimates of competing assessments, not figures the decision states |
 | `WPI % Basis` | text | 100% | how the figure was resolved: `tribunal selected`, `MAS certificate`, `assessor total`, `combined from N components (AMA Combined Values)`, `median of N competing assessments`, `withheld: … contradicts …`, or `retained from main extraction` |
 | `WPI % Candidates` | text | 29% | every distinct percentage found in the decision, ` \| `-delimited, so an outlier can be audited |
 | `WPI Threshold Finding` | enum | **100%** | `above 10%` 263 · `not above 10%` 187 · `not determined` 90 — **the legally operative fact under s 4.11**, often settled without any percentage being stated. Never empty; pair with `WPI Threshold Finding Basis` to filter to judicial findings only |
 | `WPI Threshold Finding Basis` | enum | 100% | `decision` 169 · `implied by non-economic loss award` 175 · `implied by stated WPI` 106 · `not determined` 90. **Filter to `decision` for findings the court actually made** |
-| `WPI Governing System` | enum | 100% | `physical` 92 · `psychiatric` 52 · `combined` 3 · **`not determined` 116** · `not stated` 277 — which assessment the WPI is taken from. **Computed by the resolution pass** from the classified figures, not from which cells are populated — see §3.06. `not determined` = only one body system was ever quantified, so the comparison cannot be made; `not stated` = neither was |
+| `WPI Governing System` | enum | 100% | `physical` 29 · `psychiatric` 31 · `combined` 3 · **`not determined` 134** · `not stated` 343 — which assessment the WPI is taken from. **Computed by the resolution pass** from the classified figures, not from which cells are populated — see §3.06. `not determined` = only one body system was ever quantified, so the comparison cannot be made; `not stated` = neither was |
 | `NEL Threshold Consistent` | enum | 100% | `yes` 154 · `cannot determine` 386 — does the non-economic loss award agree with the threshold finding. `no` is now empty: the only row that produced one was an ex gratia payment, where the rule never applied (see §3.1) |
 | `Non-Economic Loss` | number | 84.6% | General damages / pain and suffering |
 | `Non-Economic Loss Status` | enum | 100% | |
@@ -230,6 +230,22 @@ Triaged on the round-4 basis: `absent` now requires an **itemised** other head w
 | `WPI Psychiatric %` | 4 | psychiatric material and a percentage are present but no psychiatric total resolves |
 | `Other Damages Heads` | 2 | an itemised other head was awarded and not captured |
 | **total** | **11** | |
+
+### 3.08 Round 7 — `absent` is now empty
+
+**`absent = 0` across the workbook and across the full 3,501-row cache.** Every remaining blank carries a reason that is a fact about the source rather than a defect in the extraction. `absent` is still reachable — `test_round7_last_absent` pins that — so the check it feeds still means something; there is simply nothing currently failing it.
+
+Four changes got the last 11 there, and three of them corrected classifications rather than recovering values:
+
+**A quarantine is a decision, not a failure.** The five withheld WPIs were recorded `absent`, which asserts the figure was recoverable and we missed it — the opposite of what happened. Impairment *was* assessed (the components sit in `WPI % Candidates`); the decision simply never states the governing total. That is `not_stated`. Recording our own deliberate act as an extraction defect was the single largest contributor to the count.
+
+**A stated component is an assessment.** Row 500 carried a physical 18% and read `not_assessed`, denying a figure the row itself holds. A blank total beside a stated component is `not_stated`. This also resolves the §15.2 inconsistency: rows 218 / 302 / 323 and row 500 now read alike, because they *are* alike.
+
+**The two split columns have different contracts, and it mattered.** `WPI Psychiatric %` is specified "only if separately stated", which a psychiatric assessment satisfies on its own; `WPI Physical %` is "only if the decision states physical and psychiatric SEPARATELY", so it needs both. Round 6 required both for each, which left 4 rows `absent` with their psychiatric figure resolved and unused. Coverage 18.5% → **19.3%**.
+
+**Positive itemised residuals are captured, negative ones are not.** Macdonald's future superannuation of $26,244 is now `Other Damages Heads` with `derived` provenance — the identity gives the amount and the breakdown names the head. A *negative* residual (row 155, where past superannuation and Fox v Wood are folded into past economic loss) means the named heads overshoot the gross: the composition is ambiguous, not the amount, so there is no figure to capture and it stays `not_stated`. `Other Damages Heads` coverage **84.8%**.
+
+> **A round-5 regression this round also caught.** `WPI Governing System` was keyed on the stored cell value, so **78 rows kept a label written before round 5**, when the derivation was still circular — row 500 named `physical` on a row whose resolution holds no mentions at all. A stale answer is indistinguishable from a computed one, so the test is now about the *evidence*: the resolution's label stands only where its mentions actually cover two body systems. Single-component rows now read `not determined` without exception.
 
 ### 3.1 The s 4.11 quarantine — five blank WPIs
 
@@ -413,7 +429,7 @@ Both halves are fixed. The field prompts now name the MACA equivalents, and — 
 | `WPI Psychiatric %` | number | 17.0% | Only where stated separately |
 | `WPI Physical % Provenance` / `WPI Psychiatric % Provenance` | enum | 100% | `stated` or `absent` only — never `inferred` |
 
-> **On the split-WPI coverage.** The spec expected ~8%; we deliver 30.7% / 18.5% across the full 540 (44% / 31% among the rows that state any WPI at all). This is **not** a combined figure being split. CTP matters routinely carry two separate MAS certificates — e.g. one assessor certifying 6% for PTSD and persistent depressive disorder, another certifying 4% for cervical/thoracic/lumbar soft tissue. Note that `WPI %` is generally the **higher** of the two, not their sum: MAIA assesses physical and psychiatric separately and the greater governs the threshold.
+> **On the split-WPI coverage.** The spec expected ~8%; we deliver 30.7% / 19.3% across the full 540 (44% / 31% among the rows that state any WPI at all). This is **not** a combined figure being split. CTP matters routinely carry two separate MAS certificates — e.g. one assessor certifying 6% for PTSD and persistent depressive disorder, another certifying 4% for cervical/thoracic/lumbar soft tissue. Note that `WPI %` is generally the **higher** of the two, not their sum: MAIA assesses physical and psychiatric separately and the greater governs the threshold.
 
 ## 12. Workers-compensation overlap — NEW
 

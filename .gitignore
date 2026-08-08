@@ -63,6 +63,7 @@ test_*_output.txt
 !test_round4_statutory_benefits.py
 !test_round5_governing_system.py
 !test_round6_split_recovery.py
+!test_round7_last_absent.py
 
 # Logs
 *.log

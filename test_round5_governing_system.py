@@ -81,15 +81,41 @@ def test_a_single_system_resolution_reports_not_determined():
 def test_the_resolution_beats_the_flat_columns():
     """Quigley [2026] NSWPIC 280 (row 7). The column read `psychiatric` — the
     only component captured — while the resolution's own notes said "higher of
-    2 body systems (physical)". The notes were right."""
+    2 body systems (physical)". The notes were right.
+
+    Round 7 tightened what counts as "the resolution said so": the EVIDENCE
+    must be on the row, not just a label in the cell. Keying on the stored
+    value let 78 rows keep a label written before round 5, when the derivation
+    was still circular — a stale answer is indistinguishable from a computed
+    one. So the fixture now carries the mentions the comparison was made from.
+    """
     row = _row(**{
         "Impairment % (Accepted)": "12",
         "WPI Psychiatric %": "1",
         "WPI Governing System": "physical",       # as the resolution wrote it
         "WPI Resolution Notes": "higher of 2 body systems (physical)",
+        "_wpi_resolution": {"mentions": [
+            {"value": "12", "body_system": "physical", "kind": "MAS certificate",
+             "assessor": "Review Panel", "superseded": False, "about_claimant": True},
+            {"value": "1", "body_system": "psychiatric", "kind": "MAS certificate",
+             "assessor": "MAS Ng", "superseded": False, "about_claimant": True},
+        ]},
     })
     ns.apply_round2_semantics(row)
     assert row["WPI Governing System"] == "physical"
+
+
+def test_a_stale_label_with_no_evidence_behind_it_is_recomputed():
+    """The other half of the same fix. Row 500 named `physical` on a row whose
+    resolution holds no mentions at all — a label left over from before round 5
+    that survived every rerun because the guard trusted the cell."""
+    row = _row(**{
+        "Impairment % (Accepted)": "",
+        "WPI Physical %": "18",
+        "WPI Governing System": "physical",       # stale
+    })
+    ns.apply_round2_semantics(row)
+    assert row["WPI Governing System"] == "not determined"
 
 
 # ----------------------------------------------------------------------

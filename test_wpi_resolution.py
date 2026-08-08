@@ -549,7 +549,11 @@ def test_washbourne_component_figure_is_withheld_not_published():
     assert ns.quarantine_impossible_wpi(row) is True
     assert row["Impairment % (Accepted)"] == ""
     assert row["WPI Candidates"] == "8"
-    assert row["WPI Provenance"] == "absent"
+    # Round 7 §15.1: a deliberate withholding is `not_stated`, not `absent` —
+    # impairment WAS assessed (the components are in `WPI % Candidates`), the
+    # decision just never states the governing total. `absent` recorded our own
+    # decision as an extraction defect.
+    assert row["WPI Provenance"] == "not_stated"
     assert "s 4.11" in row["Review Notes"]
     # The rest of the row is sound — a complete $1,451,619 award with a full
     # damages breakdown — so it keeps its place in the workbook. The blank WPI

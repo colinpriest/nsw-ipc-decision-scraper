@@ -166,7 +166,11 @@ def test_macdonald_stays_a_genuine_miss():
                                "superannuation of $26,244, a subtotal of $745,111.32")}
     residual, trustworthy = dx.damages_residual(row)
     dx.refine_money_absence(row, residual=residual, residual_trustworthy=trustworthy)
-    assert row["Other Damages Heads Provenance"] == "absent"
+    # Round 7 §15.4 captures it: the identity gives the amount and the
+    # breakdown names the head, so there is nothing left to flag.
+    assert row["Other Damages Heads"] == "26244"
+    assert row["Other Damages Heads Provenance"] == "derived"
+    assert row["Other Damages Heads Status"] == "Awarded"
 
 
 def test_an_uncaptured_future_economic_loss_is_not_an_other_head():

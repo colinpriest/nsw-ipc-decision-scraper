@@ -141,7 +141,9 @@ def test_macdonald_a_genuine_uncaptured_head():
                             "superannuation of $26,244, a subtotal of $745,111.32")})
     residual, trustworthy = dx.damages_residual(row)
     dx.refine_money_absence(row, residual=residual, residual_trustworthy=trustworthy)
-    assert row["Other Damages Heads Provenance"] == "absent"
+    # Round 7 §15.4 captures the figure instead of flagging it.
+    assert row["Other Damages Heads"] == "26244"
+    assert row["Other Damages Heads Provenance"] == "derived"
 
 
 def test_taaga_an_unapportioned_settlement_is_not_an_other_head():

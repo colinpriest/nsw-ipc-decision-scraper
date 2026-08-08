@@ -2035,8 +2035,19 @@ def apply_round2_semantics(record):
     # populated was circular — with one component captured it could only name
     # the component we held, which put 145 rows in a self-fulfilling label and
     # contradicted the resolution's own notes on the rows that mattered.
-    resolved_governing = str(record.get("WPI Governing System") or "").strip()
-    if resolved_governing in ("", GoverningSystemEnum.NOT_STATED.value):
+    # The resolution's label stands only where it actually COMPARED two body
+    # systems. Round 7: keying on the stored value instead left 78 rows holding
+    # a label written before round 5, when the derivation was still circular —
+    # row 500 named `physical` on a row whose resolution has no mentions at
+    # all. A stale answer is indistinguishable from a computed one, so the test
+    # has to be about the evidence, not about what the cell currently says.
+    mention_systems = {m.get("body_system") for m in mentions
+                       if m.get("about_claimant", True) and not m.get("superseded")}
+    if len({s for s in mention_systems
+            if s in (BodySystemEnum.PHYSICAL.value,
+                     BodySystemEnum.PSYCHIATRIC.value)}) > 1:
+        pass                      # computed by resolve_wpi; authoritative
+    else:
         record["WPI Governing System"] = governing_system(phys, psych, total)
 
     # Both systems stated and no total is a gap the greater-governs rule can
@@ -2076,6 +2087,12 @@ def apply_round2_semantics(record):
     if total:
         if not str(record.get("WPI Provenance") or "").strip():
             record["WPI Provenance"] = WpiProvenanceEnum.STATED.value
+    elif record.get("_wpi_quarantined"):
+        # Migration for rows quarantined before round 7, which stored `absent`.
+        # The quarantine cannot re-fire on them — there is no value left to
+        # withhold — so the correction has to happen here.
+        if record.get("WPI Provenance") == WpiProvenanceEnum.ABSENT.value:
+            record["WPI Provenance"] = WpiProvenanceEnum.NOT_STATED.value
     elif record.get("_wpi_ex_gratia"):
         # Set by the quarantine, and deliberately not reclassified: the
         # threshold question does not arise, which is a stronger and truer
@@ -2083,9 +2100,16 @@ def apply_round2_semantics(record):
         record["WPI Provenance"] = WpiProvenanceEnum.NOT_APPLICABLE.value
     elif not record.get("_wpi_quarantined"):
         if record.get("WPI Provenance") in (None, "", *PROVENANCE_ABSENCE):
-            record["WPI Provenance"] = classify_split_wpi_absence(
-                system=BodySystemEnum.UNCLEAR.value, has_psychiatric=has_psych,
-                total_present=False, mentions=mentions)
+            # A stated component IS an assessment, so a blank total on such a
+            # row is `not_stated`, not `not_assessed`. Row 500 carries a
+            # physical 18% and read `not_assessed`, which denied a figure the
+            # row itself holds.
+            record["WPI Provenance"] = (
+                WpiProvenanceEnum.NOT_STATED.value if (phys or psych)
+                else classify_split_wpi_absence(
+                    system=BodySystemEnum.UNCLEAR.value,
+                    has_psychiatric=has_psych, total_present=False,
+                    mentions=mentions))
 
     # --- 4. s 4.11 consistency ----------------------------------------------
     # Computed from the finding AS THE DECISION MADE IT, before step 5 fills
@@ -2209,7 +2233,12 @@ def quarantine_impossible_wpi(record, text=""):
         record["WPI Candidates"] = f"{candidates} | {shown}".strip(" |")
 
     record["Impairment % (Accepted)"] = ""
-    record["WPI Provenance"] = "absent"
+    # `not_stated`, not `absent`. Round 7 §15.1: this is a DELIBERATE
+    # withholding, so recording it as a capture failure states the opposite of
+    # what happened. Impairment was assessed — the components are right there
+    # in `WPI % Candidates` — but the governing total the award implies is
+    # never stated in the decision, which is exactly `not_stated`.
+    record["WPI Provenance"] = WpiProvenanceEnum.NOT_STATED.value
     record["WPI Basis"] = (f"withheld: {shown} contradicts the award of "
                            f"non-economic loss, which s 4.11 permits only above 10%")
     record["_wpi_quarantined"] = shown
@@ -2280,12 +2309,17 @@ def merge_wpi_resolution_into_record(record, parsed):
     # Round 6 §14.1: a governing-system label asserts that the two components
     # were COMPARED, so they cannot simultaneously be `absent`. Where the
     # resolution reduced both systems, carry them into the split columns.
-    # Only when BOTH resolved — `WPI Physical %` is defined as populated only
-    # where the decision states physical and psychiatric separately, so filling
-    # from a single system would break that contract.
-    if len(systems) > 1:
-        for system, column in ((BodySystemEnum.PHYSICAL.value, "WPI Physical %"),
-                               (BodySystemEnum.PSYCHIATRIC.value, "WPI Psychiatric %")):
+    # The two columns have DIFFERENT contracts, and round 7 §15.3 turned on the
+    # difference. `WPI Physical %` is "only if the decision states physical and
+    # psychiatric SEPARATELY" — so it needs both. `WPI Psychiatric %` is "only
+    # if separately stated", which a psychiatric assessment satisfies on its
+    # own. Requiring both for each left 4 rows marked `absent` while their
+    # psychiatric figure sat resolved and unused.
+    if systems:
+        fillable = [(BodySystemEnum.PSYCHIATRIC.value, "WPI Psychiatric %")]
+        if len(systems) > 1:
+            fillable.append((BodySystemEnum.PHYSICAL.value, "WPI Physical %"))
+        for system, column in fillable:
             if str(record.get(column) or "").strip() or system not in systems:
                 continue
             resolved_value, resolved_prov, resolved_basis = systems[system]

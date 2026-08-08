@@ -1297,8 +1297,21 @@ def refine_money_absence(row, *, residual=None, residual_trustworthy=False):
                                                     row.get("Other Damages Heads Basis"))):
                     # A five-figure hole only this column can fill: the
                     # decision DID apportion, the named heads are accounted
-                    # for, and what is left over is a head we did not capture.
-                    corroborated = True
+                    # for, what is left over is itemised in the breakdown, and
+                    # it is POSITIVE. Round 7 §15.4: capture it rather than
+                    # flagging it — the identity and the itemisation together
+                    # identify both the amount and the head it belongs to.
+                    if residual > 0:
+                        row[amount_col] = f"{residual:g}"
+                        row[prov_col] = ProvenanceEnum.DERIVED.value
+                        if status_col and not str(row.get(status_col) or "").strip():
+                            row[status_col] = HeadStatusEnum.AWARDED.value
+                        continue
+                    # A NEGATIVE residual means the named heads already absorb
+                    # the other heads and overshoot the gross — the composition
+                    # is ambiguous, not the amount. There is no separate figure
+                    # to state, so this is `not_stated`, never a capture.
+                    corroborated = False
         elif amount_col == "Statutory Benefits Paid":
             # Round 4 §12.2 corrected this. A stated repayment proves benefits
             # WERE paid, but not that the decision quantifies the total paid —
