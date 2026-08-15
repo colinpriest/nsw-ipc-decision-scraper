@@ -64,6 +64,8 @@ test_*_output.txt
 !test_round5_governing_system.py
 !test_round6_split_recovery.py
 !test_round7_last_absent.py
+# ...and the WC reference-set / adjudication-draw suite
+!test_wc_reference_sets.py
 
 # Logs
 *.log
