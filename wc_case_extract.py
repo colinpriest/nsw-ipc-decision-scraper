@@ -2681,6 +2681,17 @@ REFERENCE_SET_FIELDS = [
 ]
 
 
+# Per-field overrides on --reference-size. liability_posture carries a bigger
+# sheet than the others because it is answering two questions rather than one:
+# whether partial denial is real, and whether it is localised to the dispute
+# types where the outcome lift says it should be. At 50 the diagnostic stratum
+# (Liability Dispute, 25% of the dominant cell) lands 6 cases, which supports a
+# direction and not a conclusion -- and a weak result would be unreadable,
+# because nothing would separate 'the mechanism is not there' from 'the sample
+# was too small to see it'. 80 puts it near 10 without touching the other
+# sheets, which are estimating one accuracy each and do not need the room.
+REFERENCE_SET_SIZES = {"liability_posture": 80}
+
 # Allocation for the liability_posture adjudication draw. Deliberately NOT
 # proportional to the disagreement cells: proportional would spend 35 of 50 on
 # the dominant cell and leave the reverse cell with 9, which cannot tell 'rare'
@@ -2851,7 +2862,7 @@ def build_reference_worksheets(extract, size=50, seed=20260815, prefill=False):
     for field, guidance in REFERENCE_SET_FIELDS:
         if field not in extract.columns:
             continue
-        take = min(size, len(extract))
+        take = min(REFERENCE_SET_SIZES.get(field, size), len(extract))
         adjudication = field == "liability_posture"
         if adjudication:
             sample = build_liability_adjudication_sample(extract, size=take, seed=seed)

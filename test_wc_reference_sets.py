@@ -45,6 +45,7 @@ def _extract(denied_quantum=494, quantum_denied=129, procedural=77, agreeing=167
                 "catchwords": "WORKERS COMPENSATION - permanent impairment",
                 "liability_posture": llm,
                 "liability_posture_rule": rule,
+                "primary_injury": ("back_spine", "psychological", "upper_limb")[n % 3],
                 "liability_posture_basis": basis,
                 "liability_posture_evidence": "the respondent disputes the consequential condition",
                 # Roughly the measured 48% within the dominant cell.
@@ -86,6 +87,15 @@ def test_the_dominant_cell_is_crossed_on_both_competing_explanations():
     bases = {"concession" if b in wc.CONCESSION_BASES else "nature_field_only"
              for b in dominant["liability_posture_basis"]}
     assert bases == {"concession", "nature_field_only"}
+
+
+def test_the_adjudication_sheet_is_sized_for_two_questions_not_one():
+    """The other sheets estimate one accuracy each. This one also has to say
+    whether partial denial is localised, and at 50 the diagnostic stratum lands
+    6 cases -- too few to tell 'no mechanism' from 'no power'."""
+    sheets = wc.build_reference_worksheets(_extract(), size=50)
+    assert len(sheets["liability_posture"]) == 80
+    assert len(sheets["primary_injury"]) == 50
 
 
 def test_the_diagnostic_dispute_type_survives_the_draw():
@@ -165,8 +175,8 @@ def test_scoring_refuses_to_pass_the_adjudication_off_as_corpus_accuracy(tmp_pat
     report = wc.score_reference_set(path)
     row = report[report["field"] == "liability_posture"].iloc[0]
     assert "NOT a corpus accuracy" in row["design"]
-    assert "partial-denial verdicts 25/50" in row["note"]
-    assert "llm_denied__rule_quantum: n=25" in row["note"]
+    assert "partial-denial verdicts 40/80" in row["note"]
+    assert "llm_denied__rule_quantum: n=40" in row["note"]
 
 
 def test_blank_labels_are_skipped_rather_than_scored_as_errors(tmp_path):
