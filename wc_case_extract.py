@@ -69,6 +69,17 @@ WC_REASONING_EFFORT = os.getenv("NSW_WC_REASONING_EFFORT", "low")
 # Bump when WCCaseSchema or the system instruction changes meaningfully:
 # cache entries written under an older version are discarded on load.
 WC_SCHEMA_VERSION = 8
+
+# The second pass is versioned INDEPENDENTLY of WC_SCHEMA_VERSION, and that is
+# the whole point of it existing. Bumping WC_SCHEMA_VERSION discards the cache
+# and re-extracts all 191 fields with a model measured at 91% run-to-run
+# stability, which would move every figure already written into the data
+# dictionary and the worked examples -- 494/129/77, the 47.8% consequential
+# rate, the 92.7% overlap, the 23.3-vs-4.7 definitional spread, the frozen
+# 259-case set. Documentation quoting numbers the workbook no longer contains
+# is the Diab failure mode with the docs as the victim. An additive pass adds
+# fields without disturbing any of it, at roughly a third of the cost.
+WC_CONDUCT_VERSION = 1
 LLM_CACHE_FILE = os.path.join(OUTPUT_ROOT, "wc_llm_cache.json")
 DICTIONARY_XLSX = os.path.join("docs", "wc_data_dictionary.xlsx")
 # Worksheets carry case names and catchwords, so they are written under
@@ -511,6 +522,120 @@ def _parse_pinned(extractor, system_instruction, user_content, response_format,
             logging.error(f"WC LLM error{suffix}: {error}")
             return None, None, str(error)
     return None, None, str(last_error)
+
+
+class DenialScopeEnum(str, Enum):
+    """WHAT was denied, which is what makes partial denial countable.
+
+    Under the liability_posture binary, an insurer that accepts the injury and
+    denies every consequential condition, treatment and impairment head reads as
+    'quantum only' - the cooperative category. This enumeration turns "deny in
+    part, never in whole" from an inference into a measurement.
+    """
+    primary_injury = "primary_injury"
+    consequential_condition = "consequential_condition"
+    specific_treatment = "specific_treatment"
+    impairment_head = "impairment_head"
+    weekly_entitlement = "weekly_entitlement"
+    work_capacity = "work_capacity"
+    nothing_denied = "nothing_denied"
+    not_stated = "not_stated"
+
+
+class ConductFindingEnum(str, Enum):
+    """Three-way ON PURPOSE.
+
+    'The Member said nothing about the insurer's conduct' and 'the Member
+    expressly considered it and did not criticise it' are opposite evidence for
+    convergent validity and identical under a boolean. The distinction costs
+    nothing at extraction time and cannot be recovered afterwards.
+    """
+    criticism_made = "criticism_made"
+    considered_not_criticised = "considered_not_criticised"
+    not_addressed = "not_addressed"
+
+
+class ConductScopeEnum(str, Enum):
+    """WHAT was criticised, mapped to SIRA's Standards of Practice.
+
+    Deliberately the regulator's vocabulary rather than a generic
+    disapproval scale. It lets the metric be validated against the actual
+    standard - 'does predicted loss correlate with Standards-relevant conduct
+    findings' - instead of against whether a Member was unimpressed, and it
+    absorbs surveillance and defective notices as scope values rather than
+    spawning separate booleans.
+    """
+    reasons_adequacy = "reasons_adequacy"
+    timeliness = "timeliness"
+    investigation_proportionality = "investigation_proportionality"
+    surveillance = "surveillance"
+    failure_to_consider_evidence = "failure_to_consider_evidence"
+    defective_notice = "defective_notice"
+    other_conduct = "other_conduct"
+
+
+class WCConductSchema(BaseModel):
+    """Second-pass fields: denial scope, success granularity, conduct findings.
+
+    Kept out of WCCaseSchema so it can be versioned and re-run on its own.
+    """
+    denial_scope: list[DenialScopeEnum] = Field(description=(
+        "Every head liability was denied for. ['nothing_denied'] where liability was wholly "
+        "admitted. A dispute confined to quantum is 'nothing_denied', NOT 'not_stated'."))
+    denial_scope_evidence: str = Field(description=(
+        "Short verbatim quote showing what was denied. EMPTY if nothing was denied."))
+    heads_claimed: int = Field(description=(
+        "How many distinct heads of relief the worker actually pressed for decision: weekly "
+        "compensation, medical expenses, lump sum, interest, costs, and so on. 0 if undeterminable."))
+    heads_succeeded: int = Field(description=(
+        "How many of those heads the worker actually won. Never greater than heads_claimed. "
+        "This is what turns 'mixed' from one bucket into a degree: winning four heads of five "
+        "and winning one of five are currently the same value."))
+    conduct_finding: ConductFindingEnum = Field(description=(
+        "Did the Member remark on the INSURER's conduct of the claim? 'criticism_made' only "
+        "where the Member is critical. 'considered_not_criticised' where conduct was squarely "
+        "raised or addressed and found acceptable. 'not_addressed' where the decision simply "
+        "does not deal with it - the common case, and NOT the same as approval."))
+    conduct_scope: list[ConductScopeEnum] = Field(description=(
+        "What was criticised, where conduct_finding is 'criticism_made'. Empty otherwise."))
+    conduct_evidence: str = Field(description=(
+        "Short verbatim quote of the Member's remark on conduct. EMPTY where not_addressed."))
+
+
+WC_CONDUCT_SYSTEM_INSTRUCTION = (
+    "You extract a small set of research fields from NSW Personal Injury Commission workers "
+    "compensation decisions. Report only what the decision states.\n\n"
+    "Rules that matter:\n"
+    "- Report what the MEMBER found, never what a party asserted.\n"
+    "- Absence is a finding. If the decision does not address the insurer's conduct, say "
+    "'not_addressed'. Do NOT infer approval from silence, and do NOT infer criticism from the "
+    "insurer losing: an insurer can lose with impeccable conduct on fresh medical evidence, and "
+    "can win having handled the matter badly.\n"
+    "- Criticism means the Member is critical of how the insurer handled the claim - inadequate "
+    "reasons, delay, disproportionate investigation or surveillance, failure to consider material "
+    "evidence, defective notices. Disagreeing with the insurer's case is NOT criticism of "
+    "conduct.\n"
+    "- heads_succeeded can never exceed heads_claimed. Count heads actually pressed for decision, "
+    "not every remedy mentioned in the application.\n"
+    "- Quote verbatim in the evidence fields, and leave them empty rather than paraphrasing."
+)
+
+
+def extract_wc_conduct_llm(extractor, source_text, context=None, seed=None):
+    """Run the additive second pass on one decision. Returns (parsed, usage, error)."""
+    if not source_text:
+        return None, None, "empty source"
+    user_content = (
+        "Extract the denial scope, success granularity and insurer-conduct fields from the "
+        "decision below. Report what the Member FOUND.\n\n"
+        "---\n"
+        f"{build_wc_context(source_text)}\n"
+        "---\n"
+    )
+    return _parse_pinned(
+        extractor, WC_CONDUCT_SYSTEM_INSTRUCTION, user_content, WCConductSchema,
+        context=context, reasoning_effort=WC_REASONING_EFFORT, seed=seed,
+    )
 
 
 def extract_wc_case_llm(extractor, source_text, context=None, seed=None):
@@ -1727,6 +1852,64 @@ def merge_llm_into_row(row, parsed, error=None):
     return row
 
 
+# Second-pass columns. No rule counterpart exists for any of them, so unlike
+# LLM_OVERLAY there is nothing to cross-check against and no _rule/_agreement
+# pair is emitted. conduct_finding in particular is single-source by nature:
+# no regex can tell criticism from disagreement.
+CONDUCT_OVERLAY = [
+    ("denial_scope", "denial_scope"),
+    ("denial_scope_evidence", "denial_scope_evidence"),
+    ("heads_claimed", "heads_claimed"),
+    ("heads_succeeded", "heads_succeeded"),
+    ("conduct_finding", "conduct_finding"),
+    ("conduct_scope", "conduct_scope"),
+    ("conduct_evidence", "conduct_evidence"),
+]
+
+
+def apply_conduct(row, parsed, error=None):
+    """Write the second-pass fields onto a row.
+
+    `conduct_status` distinguishes 'the pass has not been run' from 'the pass
+    ran and found nothing', for the same reason conduct_finding is three-way:
+    a blank that could mean either is not evidence of anything.
+    """
+    row["conduct_status"] = "ok" if parsed is not None else (error or "not run")
+    if parsed is None:
+        for _attribute, column in CONDUCT_OVERLAY:
+            row.setdefault(column, None)
+        row["claimant_success_degree"] = None
+        return row
+
+    for attribute, column in CONDUCT_OVERLAY:
+        value = getattr(parsed, attribute, None)
+        if isinstance(value, list):
+            value = ";".join(item.value if isinstance(item, Enum) else str(item)
+                             for item in value)
+        elif isinstance(value, Enum):
+            value = value.value
+        elif isinstance(value, str):
+            value = value[:600]
+        row[column] = value
+
+    claimed = row.get("heads_claimed") or 0
+    succeeded = row.get("heads_succeeded") or 0
+    # Guard the model's arithmetic rather than trusting it: heads_succeeded is
+    # told never to exceed heads_claimed, and a violation is a signal about the
+    # extraction, not a value to publish.
+    if claimed and succeeded > claimed:
+        row["conduct_status"] = "heads_inconsistent"
+        row["claimant_success_degree"] = None
+    elif claimed:
+        # The sensitivity curve's x-axis: the share of pressed heads actually
+        # won, so 'mixed' stops being one bucket covering four-of-five and
+        # one-of-five alike.
+        row["claimant_success_degree"] = round(succeeded / claimed, 3)
+    else:
+        row["claimant_success_degree"] = None
+    return row
+
+
 # Fields with NO usable rule counterpart. legal_complexity's "rule" is the
 # pipeline's own score, which is 2 on 93% of the corpus — comparing against a
 # constant manufactures a disagreement on every row and would be read as a
@@ -2177,6 +2360,43 @@ FIELD_DOCS = [
      "the LLM most clearly better."),
     ("liability_posture_basis", "process", "text", "audit", "",
      "Which rule produced the rule-side value."),
+    # --- Second pass (--conduct-pass), versioned independently -------------
+    ("denial_scope", "conduct", "text", "llm_second_pass",
+     "semicolon-separated: primary_injury / consequential_condition / specific_treatment / "
+     "impairment_head / weekly_entitlement / work_capacity / nothing_denied / not_stated",
+     "Every head liability was denied for. This is what makes partial denial COUNTABLE: under the "
+     "liability_posture binary, denying every consequential condition while accepting the injury "
+     "reads as the cooperative 'quantum only' category."),
+    ("denial_scope_evidence", "conduct", "text", "llm_second_pass", "",
+     "Verbatim quote showing what was denied. Empty where nothing was denied."),
+    ("heads_claimed", "conduct", "integer", "llm_second_pass", "0 = undeterminable",
+     "How many distinct heads of relief the worker pressed for decision."),
+    ("heads_succeeded", "conduct", "integer", "llm_second_pass", "<= heads_claimed",
+     "How many of those heads the worker won. Cross-checked against heads_claimed; a violation "
+     "sets conduct_status to 'heads_inconsistent' rather than publishing the value."),
+    ("claimant_success_degree", "conduct", "float", "derived", "0.0-1.0, null if heads_claimed = 0",
+     "heads_succeeded / heads_claimed. Turns the definitional question from a two-point "
+     "comparison into a sensitivity curve: 'mixed' currently covers winning four heads of five "
+     "and one of five alike."),
+    ("conduct_finding", "conduct", "text", "llm_second_pass",
+     "criticism_made / considered_not_criticised / not_addressed",
+     "Whether the Member remarked on the INSURER's conduct of the claim. Three-way on purpose: "
+     "silence and express approval are opposite evidence for convergent validity and identical "
+     "under a boolean. Losing is not criticism -- an insurer can lose with impeccable conduct on "
+     "fresh medical evidence, or win having handled the matter badly."),
+    ("conduct_scope", "conduct", "text", "llm_second_pass",
+     "semicolon-separated: reasons_adequacy / timeliness / investigation_proportionality / "
+     "surveillance / failure_to_consider_evidence / defective_notice / other_conduct",
+     "What was criticised, in SIRA Standards of Practice terms. Deliberately the regulator's "
+     "vocabulary: it lets the metric be validated against the actual standard rather than against "
+     "generalised judicial disapproval, and absorbs surveillance and defective notices as scope "
+     "values rather than separate booleans."),
+    ("conduct_evidence", "conduct", "text", "llm_second_pass", "",
+     "Verbatim quote of the Member's remark on conduct."),
+    ("conduct_status", "conduct", "text", "audit",
+     "ok / not run / heads_inconsistent / error text",
+     "Whether the second pass ran. Distinguishes 'not run' from 'ran and found nothing', for the "
+     "same reason conduct_finding is three-way."),
     ("consequential_condition_claimed", "process", "text", "llm", "Yes / No / Unknown",
      "Whether the worker claimed a condition said to flow from the accepted primary injury."),
     ("fatality", "process", "text", "llm", "Yes / No / Unknown",
@@ -2659,6 +2879,35 @@ WORKED_EXAMPLES = [
         lesson="Stratification buys representativeness on the variables you named and nothing "
                "else. Check the marginals that matter for the CONCLUSION, not the ones you "
                "happened to stratify on.",
+    ),
+    dict(
+        example="Half the budget went to two fields",
+        what_happened="The full run cost $115.37 over 5,044 calls for 2,385 decisions. Only 2,385 "
+                      "of those calls were the extraction. The other 2,659 were the stability "
+                      "gate: a best-of-three vote on primary_injury and legal_complexity, the two "
+                      "fields measured at 91% run-to-run stability.",
+        why_it_was_wrong="Nothing was wrong with the gate. What was wrong is that it was a "
+                         "default rather than a decision. Each vote re-sends the ENTIRE decision "
+                         "text - mean 50.7k characters - to re-answer two fields, so the gate "
+                         "pays full input price for a fraction of the schema and accounts for "
+                         "roughly half the run.",
+        why_it_matters="Input tokens are about 69% of this workload's cost, so architecture "
+                       "choices that re-send the source dominate the bill, and they are invisible "
+                       "in a per-call average. 'Stabilise the two shakiest fields' sounds free and "
+                       "costs $50. The same reasoning decided the conduct fields: an additive "
+                       "second pass keyed separately from the main schema costs about $42, where "
+                       "re-running everything to add them would have cost $115 - and would have "
+                       "moved every figure already published in this workbook.",
+        how_it_was_caught="Dividing the run's call count by the corpus size gave 2.11 passes' "
+                          "worth of text for one pass of output, which does not reconcile until "
+                          "you notice the gate is re-sending everything.",
+        the_fix="Price the architecture, not just the model. Ask what each mechanism re-sends, "
+                "how often, and for how much of the schema; then decide whether the quality it "
+                "buys is worth that, and record the decision either way.",
+        lesson="Cost lives in the architecture as much as the price list. Its companion lesson - "
+               "estimate token cost from the corpus LENGTH DISTRIBUTION, never from a "
+               "small-sample per-case average - is about getting the unit price right; this one "
+               "is about knowing how many units your design quietly ordered.",
     ),
 ]
 
@@ -3332,10 +3581,19 @@ def write_data_dictionary(path, columns=None, corpus=None, extract=None):
 # ----------------------------------------------------------------------
 
 def load_llm_cache(path):
-    """Read the LLM cache, dropping entries written under an older schema.
+    """Read the LLM cache. Each pass checks its OWN version on use.
 
     Keyed on URL (one per decision) rather than filename, so the duplicate
     files on disk can never produce two cache entries for one case.
+
+    Entries are no longer filtered on WC_SCHEMA_VERSION at load time. They were,
+    and that quietly coupled the two passes: a main-schema bump would have taken
+    the conduct data with it, forcing both to be re-derived together and
+    defeating the point of versioning them apart. The version gate now lives in
+    each reader -- cached_llm_extract checks _wc_schema_version,
+    cached_conduct_extract checks _conduct_version -- so a stale main record and
+    a current conduct record can coexist in one entry, and only the stale one is
+    re-extracted.
     """
     if not path or not os.path.exists(path):
         return {}
@@ -3345,8 +3603,17 @@ def load_llm_cache(path):
     except (json.JSONDecodeError, OSError) as error:
         print(f"WARNING: could not read LLM cache ({error}); starting empty")
         return {}
-    return {url: entry for url, entry in raw.items()
-            if isinstance(entry, dict) and entry.get("_wc_schema_version") == WC_SCHEMA_VERSION}
+    return {url: entry for url, entry in raw.items() if isinstance(entry, dict)}
+
+
+def cache_pass_counts(cache):
+    """How many entries are current for each pass. Reported at startup so a
+    version bump cannot silently look like an empty cache."""
+    main = sum(1 for entry in cache.values()
+               if entry.get("_wc_schema_version") == WC_SCHEMA_VERSION)
+    conduct = sum(1 for entry in cache.values()
+                  if entry.get("_conduct_version") == WC_CONDUCT_VERSION)
+    return {"entries": len(cache), "main_current": main, "conduct_current": conduct}
 
 
 def save_llm_cache(path, cache):
@@ -3460,7 +3727,9 @@ def cached_llm_extract(extractor, cache, url, text, context=None, lock=None):
         return cache.get(url)
 
     entry = _read() if lock is None else _with(lock, _read)
-    if entry is not None:
+    # The version gate moved here from load_llm_cache so the conduct pass can
+    # keep its own data in an entry whose main record is stale.
+    if entry is not None and entry.get("_wc_schema_version") == WC_SCHEMA_VERSION:
         payload = {k: v for k, v in entry.items() if not k.startswith("_")}
         try:
             return WCCaseSchema(**payload), None, True
@@ -3474,7 +3743,47 @@ def cached_llm_extract(extractor, cache, url, text, context=None, lock=None):
         record["_wc_schema_version"] = WC_SCHEMA_VERSION
 
         def _write():
+            # Carry the second pass across a main-schema re-extraction. Without
+            # this the two passes are coupled again by the back door: bumping
+            # WC_SCHEMA_VERSION would silently discard conduct data that is
+            # still current, and the additive pass would cost full price every
+            # time the main schema moved.
+            previous = cache.get(url) or {}
+            for key in ("_conduct", "_conduct_version"):
+                if key in previous:
+                    record[key] = previous[key]
+            # _votes is NOT carried: the stability votes are values of
+            # main-schema fields, so a re-extraction makes them stale.
             cache[url] = record
+        _write() if lock is None else _with(lock, _write)
+    return parsed, error, False
+
+
+def cached_conduct_extract(extractor, cache, url, text, context=None, lock=None):
+    """Second pass, memoised under its own version key. Returns (parsed, error,
+    was_cached).
+
+    Stored as a nested `_conduct` dict rather than as top-level keys so it stays
+    invisible to WCCaseSchema(**payload), which reconstructs the main record
+    from every non-underscore key in the entry.
+    """
+    def _read():
+        return cache.get(url) or {}
+
+    entry = _read() if lock is None else _with(lock, _read)
+    if entry.get("_conduct_version") == WC_CONDUCT_VERSION:
+        try:
+            return WCConductSchema(**(entry.get("_conduct") or {})), None, True
+        except Exception:
+            pass  # Malformed: fall through and re-extract.
+    if extractor is None:
+        return None, "llm disabled", False
+    parsed, _usage, error = extract_wc_conduct_llm(extractor, text, context=context)
+    if parsed is not None:
+        def _write():
+            slot = cache.setdefault(url, {})
+            slot["_conduct"] = parsed.model_dump(mode="json")
+            slot["_conduct_version"] = WC_CONDUCT_VERSION
         _write() if lock is None else _with(lock, _write)
     return parsed, error, False
 
@@ -3632,6 +3941,11 @@ def main():
                              "3x on the ~9%% that disagree.")
     parser.add_argument("--refresh-llm", action="store_true",
                         help="Ignore cached LLM results and re-extract")
+    parser.add_argument("--conduct-pass", action="store_true",
+                        help="Run the additive second pass: denial scope, success granularity "
+                             "and insurer-conduct findings. Versioned separately from the main "
+                             "schema, so it adds fields without re-deriving the other 191. "
+                             "One pass over the full corpus, no stability gate: ~$42.")
     parser.add_argument("--workers", type=int, default=int(os.getenv("NSW_WC_WORKERS", "20")),
                         help="Concurrent LLM calls (default 20)")
     parser.add_argument("--dictionary-out", default=DICTIONARY_XLSX,
@@ -3705,7 +4019,10 @@ def main():
 
     llm_cache = {} if args.refresh_llm else load_llm_cache(args.llm_cache)
     if llm_cache:
-        print(f"LLM cache: {len(llm_cache)} entries at schema v{WC_SCHEMA_VERSION}")
+        counts = cache_pass_counts(llm_cache)
+        print(f"LLM cache: {counts['entries']} entries; {counts['main_current']} current at "
+              f"schema v{WC_SCHEMA_VERSION}, {counts['conduct_current']} at conduct "
+              f"v{WC_CONDUCT_VERSION}")
 
     cache_lock = threading.Lock()
     counters = Counter()
@@ -3743,6 +4060,15 @@ def main():
             row[f"{field}_votes"] = ",".join(votes.get(field, []))
             row[f"{field}_stability"] = statuses.get(field, "not_gated")
         merge_llm_into_row(row, parsed, error)
+
+        conduct, conduct_error = None, "not run"
+        if args.conduct_pass and text and (extractor is not None or url in llm_cache):
+            conduct, conduct_error, conduct_cached = cached_conduct_extract(
+                extractor, llm_cache, url, text, context=case_id, lock=cache_lock)
+            counters["conduct_cache_hits"] += int(conduct_cached)
+            if conduct is None and extractor is not None:
+                counters["conduct_errors"] += 1
+        apply_conduct(row, conduct, conduct_error)
         derive_review_flags(row)
         normalise_row(row)
         return row

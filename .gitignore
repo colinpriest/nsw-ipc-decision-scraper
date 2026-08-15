@@ -66,6 +66,8 @@ test_*_output.txt
 !test_round7_last_absent.py
 # ...and the WC reference-set / adjudication-draw suite
 !test_wc_reference_sets.py
+# ...and the additive conduct-pass suite
+!test_wc_conduct_pass.py
 
 # Logs
 *.log
