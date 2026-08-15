@@ -3031,6 +3031,15 @@ WORKED_EXAMPLES = [
                "estimate token cost from the corpus LENGTH DISTRIBUTION, never from a "
                "small-sample per-case average - is about getting the unit price right; this one "
                "is about knowing how many units your design quietly ordered.",
+        footnote="A third miss, from a mechanism neither of the first two covers. The relief pass "
+                 "was costed at $28 from the pilot's $0.0118/call and came in at $39.50, "
+                 "$0.0166/call. The pilot cast THREE votes per case on the same prompt, so two "
+                 "in every three of its calls hit the provider's prompt cache at a tenth of the "
+                 "input price. Its per-call average was therefore structurally cheaper than any "
+                 "single-vote pass could be. Note the shape: this is the "
+                 "representative-of-the-wrong-things error applied to COST rather than to a base "
+                 "rate. A sample can be unrepresentative in its unit economics as well as in its "
+                 "population, and repeated-call designs are exactly where that bites.",
     ),
     dict(
         example="The field that was specified at the wrong granularity",
