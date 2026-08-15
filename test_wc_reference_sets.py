@@ -19,6 +19,7 @@ import re
 from collections import Counter
 
 import pandas as pd
+import pytest
 
 import wc_case_extract as wc
 
@@ -345,6 +346,33 @@ def test_no_worked_example_still_quotes_the_hundred_case_sample():
         if example["example"].startswith("The sample"):
             continue
         assert "66%" not in example.get("what_happened", "")
+
+
+def test_a_run_will_not_overwrite_hand_entered_labels(tmp_path):
+    """Every other output is regenerable; hand labels are not. The conduct run
+    regenerates this workbook by default, and labelling starts before it."""
+    path = tmp_path / "sets.xlsx"
+    extract = _extract()
+    wc.write_reference_sets(path, extract, size=50)          # first write: fine
+    wc.write_reference_sets(path, extract, size=50)          # unlabelled: still fine
+
+    sheet = pd.read_excel(pd.ExcelFile(path), "liability_posture")
+    sheet["HUMAN_liability_posture"] = sheet["HUMAN_liability_posture"].astype(object)
+    sheet.loc[sheet.index[0], "HUMAN_liability_posture"] = "liability_denied_in_part"
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        sheet.to_excel(writer, sheet_name="liability_posture", index=False)
+
+    with pytest.raises(RuntimeError, match="Refusing to overwrite"):
+        wc.write_reference_sets(path, extract, size=50)
+
+
+def test_the_label_guard_fails_open_on_an_unreadable_file(tmp_path):
+    """Blocking the pipeline over a file nobody has labelled would be the wrong
+    failure direction."""
+    path = tmp_path / "not-a-workbook.xlsx"
+    path.write_text("garbage", encoding="utf-8")
+    assert wc.count_human_labels(path) == 0
+    assert wc.count_human_labels(tmp_path / "absent.xlsx") == 0
 
 
 def test_a_frame_without_the_rule_column_yields_no_sheet_rather_than_a_bad_one():

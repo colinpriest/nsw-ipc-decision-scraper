@@ -3197,6 +3197,33 @@ def _rate(successes, total):
     return f"{successes}/{total} = {round(100 * successes / total)}% [{low}-{high}]"
 
 
+def count_human_labels(path):
+    """How many HUMAN_ cells in an existing worksheet have been filled in.
+
+    Returns 0 for a missing or unreadable file: the guard this feeds must fail
+    open, since refusing to write because a workbook could not be parsed would
+    block the pipeline over a file nobody has labelled.
+    """
+    if not path or not os.path.exists(path):
+        return 0
+    try:
+        book = pd.ExcelFile(path)
+    except Exception:
+        return 0
+    filled = 0
+    for name in book.sheet_names:
+        try:
+            sheet = pd.read_excel(book, name)
+        except Exception:
+            continue
+        for column in sheet.columns:
+            if str(column).startswith("HUMAN_"):
+                values = sheet[column]
+                filled += int((values.notna()
+                               & values.astype(str).str.strip().ne("")).sum())
+    return filled
+
+
 def score_reference_set(path):
     """Read back completed worksheets and report LLM accuracy per field.
 
@@ -3460,6 +3487,14 @@ def write_reference_sets(path, extract, size=50, seed=20260815, prefill=False):
     """
     if extract is None or not len(extract):
         return {}
+    existing = count_human_labels(path)
+    if existing:
+        # Every other output here is regenerable; hand labels are not. A run
+        # whose point is to ADD fields must not silently destroy the human work
+        # the fields were designed around.
+        raise RuntimeError(
+            f"{path} already holds {existing} hand-entered label(s). Refusing to overwrite. "
+            f"Move it aside, or pass --reference-out with a different path.")
     worksheets = build_reference_worksheets(extract, size=size, seed=seed, prefill=prefill)
     frozen = freeze_definitional_set(extract)
     shift = summarise_definitional_shift(extract)
