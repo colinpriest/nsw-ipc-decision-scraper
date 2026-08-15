@@ -381,6 +381,42 @@ def test_the_resolved_value_replaces_the_single_vote_on_the_row():
     assert row["relief_stability"] == "revoted_majority"
 
 
+def test_the_invariants_catch_the_vote_duplication_signature():
+    """The one defect in this build whose symptom was reassurance. A check that
+    fires only on suspicion could never have reached it."""
+    import pandas as pd
+    clean = pd.DataFrame([{"relief_agreement": "unanimous",
+                           "relief_votes": "partly_granted,partly_granted,partly_granted"}])
+    report = wc.audit_invariants(clean)
+    assert report[report["invariant"] == "unanimous_needs_2plus_votes"]["violations"].iloc[0] == 0
+
+    duplicated = pd.DataFrame([{"relief_agreement": "unanimous",
+                                "relief_votes": "partly_granted"}])
+    report = wc.audit_invariants(duplicated)
+    assert report[report["invariant"] == "unanimous_needs_2plus_votes"]["violations"].iloc[0] == 1
+
+
+def test_the_invariants_catch_contradictions_the_data_should_not_express():
+    import pandas as pd
+    frame = pd.DataFrame([
+        {"conduct_finding": "not_addressed", "conduct_scope": "timeliness",
+         "heads_claimed": 2, "heads_succeeded": 5,
+         "denial_scope": "nothing_denied;specific_treatment"},
+        {"conduct_finding": "criticism_made", "conduct_scope": "timeliness",
+         "heads_claimed": 3, "heads_succeeded": 1, "denial_scope": "specific_treatment"},
+    ])
+    report = wc.audit_invariants(frame).set_index("invariant")["violations"]
+    assert report["scope_only_when_criticised"] == 1
+    assert report["succeeded_never_exceeds_claimed"] == 1
+    assert report["nothing_denied_is_exclusive"] == 1
+
+
+def test_the_invariants_run_on_a_frame_that_lacks_the_columns():
+    """They must never be the reason a run fails."""
+    import pandas as pd
+    assert len(wc.audit_invariants(pd.DataFrame([{"case_id": "x"}]))) == 0
+
+
 def test_every_new_column_is_documented():
     """The dictionary asserts coverage; a new column with no entry comes back
     as UNDOCUMENTED rather than being silently omitted."""

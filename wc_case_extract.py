@@ -3063,6 +3063,70 @@ WORKED_EXAMPLES = [
                "is USEFUL, and the two come apart exactly when a field is derived rather than "
                "observed.",
     ),
+    dict(
+        example="The bug whose symptom was reassurance",
+        what_happened="The relief ordinal is delivered by a single production vote and re-voted "
+                      "on the middle categories. Combining the delivered value with the "
+                      "re-votes by appending them to a list looks obviously correct. It is not: "
+                      "the production pass and the pilot's first vote use the SAME seed, so on "
+                      "the 100 pilot cases one opinion would have been counted twice.",
+        why_it_was_wrong="A duplicated answer always agrees with itself. Those cases would have "
+                         "reported 'unanimous' on the strength of a single opinion - and they are "
+                         "precisely the cases the pilot used to decide the field was stable "
+                         "enough to buy.",
+        why_it_matters="Look at the symptom. Every other failure in this set announced itself "
+                       "with an anomaly that INVITED a check: a 17-point gap between sample and "
+                       "corpus, a distribution flat at 1.0, a middle-category share slightly too "
+                       "high. This one's symptom is a HIGHER STABILITY NUMBER. It does not merely "
+                       "fail to invite investigation, it actively discourages it, because nobody "
+                       "audits a reassuring result. Diab at least produced a profile that a "
+                       "domain expert might have squinted at; a stability figure of 95% instead "
+                       "of 89% would have been quietly welcomed by everyone.",
+        how_it_was_caught="From a fact about the CODE - that two call sites share a seed constant "
+                          "- not from a fact about the data. No amount of looking at the output "
+                          "would have surfaced it, because the output would have looked better "
+                          "than the truth.",
+        the_fix="Key votes by seed rather than accumulating them, so the same opinion cannot vote "
+                "twice, and assert it in a test that fails if the collection order changes.",
+        lesson="A number that is too good never prompts anyone to look. Any check that fires only "
+               "when something seems wrong is structurally incapable of catching errors whose "
+               "symptom is that things seem right.",
+    ),
+    dict(
+        example="Three species of wrong number, and the residual none of them catch",
+        what_happened="The failures in this build are not all the same kind of thing, and sorting "
+                      "them is what makes the defences selectable rather than a checklist. "
+                      "(1) SIGNABLE BIAS - the pilot's records[:100] draw. Once the mechanism is "
+                      "known the direction is known. (2) UNSIGNABLE BIAS - the Diab contamination "
+                      "and the sample's dispute-type drift. Plausibility gives no clue which way "
+                      "the error runs. (3) WRONG CONSTRUCT - the heads_succeeded/heads_claimed "
+                      "ratio. Not a biased estimate at all: the measure does not measure the "
+                      "thing.",
+        why_it_was_wrong="Each species defeats the defences suited to the others. Standardising "
+                         "does nothing for an error whose direction you cannot sign. A second "
+                         "extractor is the only way to find contamination - and is exactly what "
+                         "fails against a wrong construct, because a second measure of the same "
+                         "wrong construct agrees with the first perfectly. Debiasing a wrong "
+                         "construct is not possible at all; only replacement is.",
+        why_it_matters="The three map onto three defences this build actually used, and each was "
+                       "used on the right species: standardise it (re-weighting the corpus to the "
+                       "sample's dispute mix, 63.0% -> 59.8%); check provenance against an "
+                       "independent source (stripping citation context to find NRMA was a case "
+                       "name); look at the DISTRIBUTION before trusting the field (the pilot "
+                       "histogram, which would have shown 64.4% single-head immediately).",
+        how_it_was_caught="Each by chasing an anomaly. That is the pattern - and the problem.",
+        the_fix="Match the defence to the species rather than running all three as ritual. But "
+                "note what the taxonomy exposes: all three defences are TRIGGERED BY SUSPICION. "
+                "Something has to look wrong first. So build at least one check that runs whether "
+                "or not anything looks off - a test that fails on a duplicated vote, a provenance "
+                "column that must be populated, an assertion that a field's coverage is what it "
+                "was last run - because those are the only checks that reach the errors nobody "
+                "would think to investigate.",
+        lesson="The residual risk after every suspicion-triggered defence lives entirely in "
+               "results that look right. That is not a gap in diligence, it is a structural "
+               "property of diligence, and the only answer is checks that do not wait to be "
+               "motivated.",
+    ),
 ]
 
 
@@ -4117,6 +4181,59 @@ def run_relief_pilot(args, records, file_index, extractor, llm_cache, cache_lock
     return report
 
 
+def audit_invariants(extract):
+    """Structural checks that run on EVERY run, wanted or not.
+
+    Every other check in this pipeline is triggered by suspicion: a
+    disagreement flag, an odd marginal, a flat histogram. That leaves the
+    residual risk sitting entirely in results that look right, which is where
+    the vote-duplication bug would have lived - its symptom was a HIGHER
+    stability number.
+
+    So these fire unconditionally and cost nothing. Each one is a contradiction
+    the data should be incapable of expressing; a non-zero count means a
+    pipeline defect, not an interesting case.
+    """
+    checks = []
+
+    def add(name, mask, note):
+        count = int(mask.sum()) if hasattr(mask, "sum") else 0
+        checks.append({"invariant": name, "violations": count, "means": note})
+
+    columns = set(extract.columns)
+
+    if {"relief_agreement", "relief_votes"} <= columns:
+        votes = extract["relief_votes"].fillna("").astype(str)
+        distinct = votes.apply(lambda v: len([p for p in v.split(",") if p]))
+        # The vote-duplication signature: agreement claimed on one opinion.
+        add("unanimous_needs_2plus_votes",
+            extract["relief_agreement"].eq("unanimous") & distinct.lt(2),
+            "a vote counted twice would report unanimity from a single opinion")
+        add("majority_needs_3plus_votes",
+            extract["relief_agreement"].eq("majority") & distinct.lt(3),
+            "a majority cannot be formed from fewer than three votes")
+
+    if {"conduct_finding", "conduct_scope"} <= columns:
+        scope = extract["conduct_scope"].fillna("").astype(str).str.strip()
+        add("scope_only_when_criticised",
+            scope.ne("") & extract["conduct_finding"].ne("criticism_made"),
+            "something was criticised without a criticism finding")
+
+    if {"heads_claimed", "heads_succeeded"} <= columns:
+        claimed = pd.to_numeric(extract["heads_claimed"], errors="coerce").fillna(0)
+        succeeded = pd.to_numeric(extract["heads_succeeded"], errors="coerce").fillna(0)
+        add("succeeded_never_exceeds_claimed", succeeded.gt(claimed),
+            "more heads won than were pressed")
+
+    if "denial_scope" in columns:
+        denial = extract["denial_scope"].fillna("").astype(str)
+        add("nothing_denied_is_exclusive",
+            denial.str.contains("nothing_denied") & denial.str.contains(";"),
+            "nothing was denied, and also something was")
+
+    return pd.DataFrame(checks)
+
+
 def summarise_relief_pilot(all_votes):
     """The two questions the pilot exists to answer, and nothing else.
 
@@ -4690,6 +4807,18 @@ def main():
     print(f"\nWrote {out_path}: {len(extract)} rows x {len(extract.columns)} columns")
     if args.llm_cache:
         print(f"LLM cache: {cache_hits} hits, {len(llm_cache)} entries -> {args.llm_cache}")
+
+    # Unconditional: these are the only checks that reach a defect whose
+    # symptom is that everything looks fine.
+    invariants = audit_invariants(extract)
+    if len(invariants):
+        broken = invariants[invariants["violations"] > 0]
+        if len(broken):
+            print("\nINVARIANT VIOLATIONS (pipeline defects, not interesting cases):")
+            for _, row in broken.iterrows():
+                print(f"  {row['invariant']:<34} {row['violations']:>5}  {row['means']}")
+        else:
+            print(f"\nInvariants: {len(invariants)} checked, all clean")
     if missing:
         print(f"WARNING: {missing} rows had no readable HTML; text-derived fields are blank")
     if llm_errors:
