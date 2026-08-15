@@ -2597,9 +2597,125 @@ REFERENCE_SET_FIELDS = [
                          "limitation/estoppel, reconsideration, unsettled construction, or credit "
                          "findings. 1 = otherwise."),
     ("liability_posture", "Was injury/liability itself in issue, or was it admitted and only "
-                          "entitlement/treatment/amount disputed? A disputed CONSEQUENTIAL "
-                          "condition counts as liability_denied."),
+                          "entitlement/treatment/amount disputed? Answer liability_denied_in_part "
+                          "where liability was admitted for the primary injury but denied for a "
+                          "consequential condition, a particular treatment, or an impairment "
+                          "head. That third value is THE HYPOTHESIS UNDER TEST: neither extractor "
+                          "could return it, so do not force such a case into either binary "
+                          "answer, and do not shy off it because it is not in the schema."),
 ]
+
+
+# Allocation for the liability_posture adjudication draw. Deliberately NOT
+# proportional to the disagreement cells: proportional would spend 35 of 50 on
+# the dominant cell and leave the reverse cell with 9, which cannot tell 'rare'
+# from 'absent'.
+LIABILITY_ADJUDICATION_SHARES = (
+    ("llm_denied__rule_quantum", 0.50),
+    ("llm_quantum__rule_denied", 0.24),
+    ("procedural_either_side", 0.26),
+)
+
+# Rule bases that quote actual concession language, as against inferring the
+# posture from the Nature field alone. The two carry very different weight when
+# the rule contradicts the LLM.
+CONCESSION_BASES = {"liability_expressly_accepted", "both_signals_concession_first",
+                    "explicit_concession"}
+
+
+def liability_disagreement_cell(llm, rule):
+    """Which rule-vs-LLM disagreement cell a row sits in, or None if they agree."""
+    llm, rule = str(llm).strip(), str(rule).strip()
+    if llm == rule:
+        return None
+    if llm == "liability_denied" and rule == "quantum_or_entitlement_only":
+        return "llm_denied__rule_quantum"
+    if llm == "quantum_or_entitlement_only" and rule == "liability_denied":
+        return "llm_quantum__rule_denied"
+    if "not_applicable_procedural" in (llm, rule):
+        return "procedural_either_side"
+    return "other"
+
+
+def build_liability_adjudication_sample(extract, size=50, seed=20260815):
+    """Draw liability_posture cases from the DISAGREEMENT cells, not the label.
+
+    Stratifying on the model's own label (what every other reference set does)
+    is right when the only question is 'how often is the model wrong'. It is the
+    wrong design here, because the cross-tab already answers a different
+    question. The disagreement is directional 4:1 -- 494 cases where the LLM
+    reads denial and the rule reads quantum-only, against 129 the other way --
+    and a consequential condition is claimed in 47.8% of that dominant cell
+    against a 25.6% base rate. Both readers are quoting real language.
+
+    That is the signature of PARTIAL denial: liability admitted for the primary
+    injury, denied for the consequential condition, the treatment, or the
+    impairment head. So this sample's job is not to pick a winner between the
+    methods; it is to test whether the category needs a third value.
+
+    The dominant cell is therefore crossed on two axes at once:
+      - consequential_condition_claimed, the hypothesised mechanism;
+      - whether the rule had explicit concession language or only the Nature
+        field (88 of the 494 are nature_field alone, which is a weak-rule
+        failure rather than an under-specified category).
+    The two competing explanations separate on exactly that cross, which a
+    single-axis split would blur.
+    """
+    if extract is None or not len(extract):
+        return pd.DataFrame()
+    needed = {"liability_posture", "liability_posture_rule"}
+    if not needed.issubset(extract.columns):
+        return pd.DataFrame()
+
+    frame = extract.copy()
+    frame["_cell"] = [liability_disagreement_cell(a, b)
+                      for a, b in zip(frame["liability_posture"],
+                                      frame["liability_posture_rule"])]
+    disagreements = frame[frame["_cell"].notna() & (frame["_cell"] != "other")]
+    if not len(disagreements):
+        return pd.DataFrame()
+
+    # Largest-remainder allocation over the fixed shares, capped by what each
+    # cell actually holds; anything that cannot be placed falls through to the
+    # cells that still have rows.
+    available = {name: int((disagreements["_cell"] == name).sum())
+                 for name, _share in LIABILITY_ADJUDICATION_SHARES}
+    size = min(size, len(disagreements))
+    exact = {name: size * share for name, share in LIABILITY_ADJUDICATION_SHARES}
+    allocation = {name: min(int(exact[name]), available[name]) for name in exact}
+    remainders = sorted(exact, key=lambda name: exact[name] - int(exact[name]), reverse=True)
+    while sum(allocation.values()) < size:
+        progressed = False
+        for name in remainders:
+            if sum(allocation.values()) >= size:
+                break
+            if allocation[name] < available[name]:
+                allocation[name] += 1
+                progressed = True
+        if not progressed:
+            break
+
+    chunks = []
+    for name, take in allocation.items():
+        if take <= 0:
+            continue
+        cell = disagreements[disagreements["_cell"] == name]
+        if name == "llm_denied__rule_quantum":
+            consequential = cell.get("consequential_condition_claimed",
+                                     pd.Series("Unknown", index=cell.index)).astype(str)
+            basis = cell.get("liability_posture_basis",
+                             pd.Series("", index=cell.index)).astype(str)
+            cell = cell.assign(_substratum=[
+                f"{c}|{'concession' if b in CONCESSION_BASES else 'nature_field_only'}"
+                for c, b in zip(consequential, basis)])
+            chunk, _ = stratified_sample(cell, "_substratum", take, seed)
+            chunk = chunk.drop(columns=["_substratum"])
+        else:
+            chunk = cell.sample(n=min(take, len(cell)), random_state=seed)
+        chunks.append(chunk)
+    if not chunks:
+        return pd.DataFrame()
+    return pd.concat(chunks).sample(frac=1, random_state=seed)
 
 
 def build_reference_worksheets(extract, size=50, seed=20260815, prefill=False):
@@ -2621,15 +2737,24 @@ def build_reference_worksheets(extract, size=50, seed=20260815, prefill=False):
         if field not in extract.columns:
             continue
         take = min(size, len(extract))
-        sample, _ = stratified_sample(extract, field, take, seed)
+        adjudication = field == "liability_posture"
+        if adjudication:
+            sample = build_liability_adjudication_sample(extract, size=take, seed=seed)
+            if not len(sample):
+                continue
+        else:
+            sample, _ = stratified_sample(extract, field, take, seed)
         columns = [c for c in ("case_id", "case_name", "source_html_file", "nature_of_case",
                                "catchwords")
                    if c in sample.columns]
         sheet = sample[columns].copy()
         evidence = f"{field}_evidence" if f"{field}_evidence" in sample.columns else None
         reason = f"{field}_reason" if f"{field}_reason" in sample.columns else None
+        # On the adjudication sheet the evidence quote is the LLM's OWN choice of
+        # supporting words, so showing it up front argues one side of the very
+        # disagreement being adjudicated. It moves to the hideable tail instead.
         for extra in (evidence, reason):
-            if extra:
+            if extra and not adjudication:
                 sheet[extra] = sample[extra]
         sheet["GUIDANCE"] = guidance
         if prefill:
@@ -2638,7 +2763,18 @@ def build_reference_worksheets(extract, size=50, seed=20260815, prefill=False):
             sheet[f"HUMAN_{field}"] = ""
         sheet["HUMAN_confident"] = ""
         sheet["HUMAN_notes"] = ""
+        # Everything from here is hideable: it reveals what the extractors said.
         # The model's answer goes LAST so a labeller can hide the column.
+        if adjudication:
+            # The cell name encodes BOTH answers, so it is tail material too --
+            # but it has to survive into the workbook, because scoring is
+            # per-cell and a whole-sheet accuracy on a disagreement-stratified
+            # draw is not a corpus accuracy.
+            for extra in (evidence, "liability_posture_basis",
+                          "consequential_condition_claimed", "_cell"):
+                if extra and extra in sample.columns:
+                    sheet[extra] = sample[extra]
+            sheet[f"RULE_{field}"] = sample[f"{field}_rule"]
         sheet[f"MODEL_{field}"] = sample[field]
         worksheets[field] = sheet
     return worksheets
@@ -2660,21 +2796,52 @@ def score_reference_set(path):
         human_column, model_column = f"HUMAN_{field}", f"MODEL_{field}"
         if human_column not in sheet.columns or model_column not in sheet.columns:
             continue
+        # A sheet carrying _cell was drawn from the disagreement cells on
+        # purpose, so its accuracy is NOT an estimate of corpus accuracy -- it
+        # is conditioned on the two methods already disagreeing, where the LLM
+        # is wrong far more often than it is at large. Reporting the two designs
+        # under one unlabelled 'accuracy' column would invite exactly that
+        # misreading.
+        adjudication = "_cell" in sheet.columns
+        design = ("adjudication: disagreement-stratified, NOT a corpus accuracy"
+                  if adjudication else "label-stratified")
         labelled = sheet[sheet[human_column].astype(str).str.strip().ne("")
                          & sheet[human_column].notna()]
         if not len(labelled):
             report.append({"field": field, "labelled": 0, "accuracy": None,
-                           "note": "no human labels entered yet"})
+                           "design": design, "note": "no human labels entered yet"})
             continue
         human = labelled[human_column].astype(str).str.strip()
         model = labelled[model_column].astype(str).str.strip()
         correct = (human == model).sum()
         confusions = Counter(f"{m} -> {h}" for m, h in zip(model, human) if m != h)
+        note = "; ".join(f"{k} ({v})" for k, v in confusions.most_common(5)) or "no errors"
+
+        if adjudication:
+            rule_column = f"RULE_{field}"
+            rule = (labelled[rule_column].astype(str).str.strip() if rule_column in labelled
+                    else pd.Series("", index=labelled.index))
+            partial = human.str.contains("in_part", case=False, na=False)
+            parts = [f"partial-denial verdicts {partial.sum()}/{len(labelled)} "
+                     f"({round(100 * partial.mean(), 1)}%)"]
+            if rule_column in labelled:
+                parts.append(f"human sides with LLM {(human == model).sum()}, "
+                             f"with rule {(human == rule).sum()}, "
+                             f"with neither {((human != model) & (human != rule)).sum()}")
+            for cell, rows in labelled.groupby(labelled["_cell"].astype(str)):
+                cell_human = rows[human_column].astype(str).str.strip()
+                cell_model = rows[model_column].astype(str).str.strip()
+                cell_partial = cell_human.str.contains("in_part", case=False, na=False).sum()
+                parts.append(f"{cell}: n={len(rows)}, LLM right "
+                             f"{(cell_human == cell_model).sum()}, partial {cell_partial}")
+            note = " | ".join(parts) + f" || confusions: {note}"
+
         report.append({
             "field": field,
             "labelled": len(labelled),
             "accuracy": round(100 * correct / len(labelled), 1),
-            "note": "; ".join(f"{k} ({v})" for k, v in confusions.most_common(5)) or "no errors",
+            "design": design,
+            "note": note,
         })
     return pd.DataFrame(report)
 
@@ -2756,6 +2923,15 @@ def write_reference_sets(path, extract, size=50, seed=20260815, prefill=False):
                             "source_html_file only where the catchwords are inconclusive."},
             {"instruction": "Leave HUMAN_<field> blank if genuinely undecidable; blanks are "
                             "skipped in scoring rather than counted as errors."},
+            {"instruction": "liability_posture is an ADJUDICATION sheet, drawn only from cases "
+                            "where the rule and the LLM disagree. Its accuracy is therefore not "
+                            "the field's accuracy on the corpus - it is conditioned on a known "
+                            "disagreement. Do not quote it as a field-level accuracy."},
+            {"instruction": "On liability_posture, liability_denied_in_part is a permitted answer "
+                            "and is the point of the exercise: neither extractor could return it. "
+                            "Use it where liability was admitted for the primary injury but "
+                            "denied for a consequential condition, a treatment, or an impairment "
+                            "head."},
             {"instruction": "Score with: python wc_case_extract.py --score-validation "
                             "output/wc_reference_sets.xlsx"},
         ]).to_excel(writer, sheet_name="how_to_label", index=False)
@@ -3169,8 +3345,9 @@ def main():
             return
         print("\nLLM accuracy against the human reference set:")
         for _, row in report.iterrows():
-            accuracy = "n/a" if row["accuracy"] is None else f"{row['accuracy']}%"
-            print(f"  {row['field']:<22} {accuracy:>7}  (n={row['labelled']})  {row['note']}")
+            accuracy = "n/a" if pd.isna(row["accuracy"]) else f"{row['accuracy']}%"
+            print(f"  {row['field']:<22} {accuracy:>7}  (n={row['labelled']})  [{row['design']}]")
+            print(f"  {'':<22} {row['note']}")
         return
 
     frame = pd.read_csv(args.csv, low_memory=False)
