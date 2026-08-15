@@ -1735,7 +1735,7 @@ def merge_llm_into_row(row, parsed, error=None):
 # opinion and must not be reported as a quality signal. Validate these two
 # against a HAND-LABELLED sample instead: see --validation-sample.
 NO_RULE_BASELINE = {"legal_complexity", "primary_injury", "mechanism",
-                    "liability_posture", "proceeding_posture"}
+                    "proceeding_posture"}
 
 # Facts the CORPUS genuinely almost never records. An all-empty column here is
 # a property of the source material, not a failed extractor, and must not be
@@ -2567,6 +2567,126 @@ WORKED_EXAMPLES = [
                "footnote. Report the base rate under both definitions.",
     ),
 ]
+
+
+# Fields that carry weight and now have no rule cross-check, so a human
+# reference set is the only validation available. liability_posture is here
+# too: it HAS a cross-check, but it feeds the metric directly, so an
+# independent reference set is worth having regardless.
+REFERENCE_SET_FIELDS = [
+    ("primary_injury", "Body system the ORDERS address. 'multiple' only if two are equally "
+                       "central; 'not_stated' if the decision never identifies an injury."),
+    ("mechanism", "How the injury happened, per the decision. 'not_stated' is correct and common "
+                  "where liability is admitted and only treatment is in issue."),
+    ("legal_complexity", "0 = single issue, settled principle, no oral evidence. 2 = s 11A on "
+                         "merits, worker-status contest, 3+ parties or s 151Z, jurisdiction/"
+                         "limitation/estoppel, reconsideration, unsettled construction, or credit "
+                         "findings. 1 = otherwise."),
+    ("liability_posture", "Was injury/liability itself in issue, or was it admitted and only "
+                          "entitlement/treatment/amount disputed? A disputed CONSEQUENTIAL "
+                          "condition counts as liability_denied."),
+]
+
+
+def build_reference_worksheets(extract, size=50, seed=20260815, prefill=False):
+    """One blank hand-labelling worksheet per field needing a human reference set.
+
+    Returns {field: DataFrame}. Each is stratified on the model's own label so
+    rare categories appear, and carries the evidence a labeller needs — the
+    catchwords state what was decided — plus the source filename for the full
+    text.
+
+    `prefill` is off by default ON PURPOSE. Pre-filling the model's answer into
+    the human column would anchor the labeller and inflate measured accuracy;
+    the whole point of the reference set is independence.
+    """
+    worksheets = {}
+    if extract is None or not len(extract):
+        return worksheets
+    for field, guidance in REFERENCE_SET_FIELDS:
+        if field not in extract.columns:
+            continue
+        take = min(size, len(extract))
+        sample, _ = stratified_sample(extract, field, take, seed)
+        columns = [c for c in ("case_id", "case_name", "source_html_file", "nature_of_case",
+                               "catchwords")
+                   if c in sample.columns]
+        sheet = sample[columns].copy()
+        evidence = f"{field}_evidence" if f"{field}_evidence" in sample.columns else None
+        reason = f"{field}_reason" if f"{field}_reason" in sample.columns else None
+        for extra in (evidence, reason):
+            if extra:
+                sheet[extra] = sample[extra]
+        sheet["GUIDANCE"] = guidance
+        if prefill:
+            sheet[f"HUMAN_{field}"] = sample[field]
+        else:
+            sheet[f"HUMAN_{field}"] = ""
+        sheet["HUMAN_confident"] = ""
+        sheet["HUMAN_notes"] = ""
+        # The model's answer goes LAST so a labeller can hide the column.
+        sheet[f"MODEL_{field}"] = sample[field]
+        worksheets[field] = sheet
+    return worksheets
+
+
+def score_reference_set(path):
+    """Read back completed worksheets and report LLM accuracy per field.
+
+    Scores only rows where a human label was actually entered, and reports the
+    confusion pairs so a systematic bias (rather than scattered error) is
+    visible.
+    """
+    book = pd.ExcelFile(path)
+    report = []
+    for field, _guidance in REFERENCE_SET_FIELDS:
+        if field not in book.sheet_names:
+            continue
+        sheet = pd.read_excel(book, field)
+        human_column, model_column = f"HUMAN_{field}", f"MODEL_{field}"
+        if human_column not in sheet.columns or model_column not in sheet.columns:
+            continue
+        labelled = sheet[sheet[human_column].astype(str).str.strip().ne("")
+                         & sheet[human_column].notna()]
+        if not len(labelled):
+            report.append({"field": field, "labelled": 0, "accuracy": None,
+                           "note": "no human labels entered yet"})
+            continue
+        human = labelled[human_column].astype(str).str.strip()
+        model = labelled[model_column].astype(str).str.strip()
+        correct = (human == model).sum()
+        confusions = Counter(f"{m} -> {h}" for m, h in zip(model, human) if m != h)
+        report.append({
+            "field": field,
+            "labelled": len(labelled),
+            "accuracy": round(100 * correct / len(labelled), 1),
+            "note": "; ".join(f"{k} ({v})" for k, v in confusions.most_common(5)) or "no errors",
+        })
+    return pd.DataFrame(report)
+
+
+def freeze_definitional_set(extract):
+    """The outcome disagreements, frozen as a named teaching set.
+
+    These are NOT extraction errors to be resolved. They are the
+    mixed-versus-clean-win boundary, where two competent readers disagree
+    because the definition is underdetermined. Students arguing case by case
+    about whether each is a 'loss' is the exercise.
+    """
+    if extract is None or "outcome_agreement" not in extract.columns:
+        return pd.DataFrame()
+    disputed = extract[extract["outcome_agreement"] == "differs"].copy()
+    columns = [c for c in ("case_id", "case_name", "nature_of_case", "source_html_file",
+                           "outcome", "outcome_rule", "outcome_reason", "result_text",
+                           "outcome_analysable", "catchwords")
+               if c in disputed.columns]
+    frozen = disputed[columns].copy()
+    frozen.insert(0, "set_name", "DEFINITIONAL_RISK_OUTCOME_V1")
+    frozen["question_for_students"] = (
+        "Is this a win for the worker, a loss, or neither? The two extractors disagreed. "
+        "Decide, state the rule you applied, and apply that rule consistently to the rest of "
+        "the set.")
+    return frozen
 
 
 def build_validation_worksheet(extract, size=40, seed=20260815):
