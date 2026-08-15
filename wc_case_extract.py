@@ -2564,13 +2564,19 @@ WORKED_EXAMPLES = [
     ),
     dict(
         example="'The insurer loses' is a definition, not an observation",
-        what_happened="The rule-side outcome classifier put the worker's success rate at 75.2% "
-                      "across the full corpus. The LLM pass, on a 100-case sample, put it at "
-                      "66%, finding roughly twice as much 'mixed' (11% vs 5.2%).",
+        what_happened="Over the full corpus the rule-side outcome classifier puts the worker's "
+                      "success rate at 75.2% and the LLM pass at 72.3%, with the LLM finding "
+                      "roughly twice as much 'mixed' (10.7% vs 5.2%). The two disagree on 259 "
+                      "cases, 10.9% of the corpus - and 'mixed' appears on one side or the other "
+                      "in 92.7% of them.",
         why_it_was_wrong="Neither is wrong. They disagree about whether a partial success - the "
-                         "worker wins on some heads and loses on others - counts as a win.",
-        why_it_matters="The choice moves the headline base rate by about nine points. If that "
-                       "base rate feeds a remuneration or conduct metric, money attaches to the "
+                         "worker wins on some heads and loses on others - counts as a win. The "
+                         "disagreement set and the partial-success population are effectively the "
+                         "same object.",
+        why_it_matters="Counting 'mixed' as a win rather than a loss moves the headline base rate "
+                       "by 10.7 points, and it does not move it evenly: Permanent Impairment is "
+                       "30.1% of the disagreement set against 15.8% of the corpus. If that base "
+                       "rate feeds a remuneration or conduct metric, money attaches to the "
                        "definition, and a scheme participant will contest the definition of "
                        "'loss' long before it contests any model built on top of it.",
         how_it_was_caught="Two classifiers with different granularity were run over the same "
@@ -2579,6 +2585,75 @@ WORKED_EXAMPLES = [
                 "the metric, and report sensitivity to the alternative definition.",
         lesson="Definitional risk is quantifiable and belongs in the metric design, not in a "
                "footnote. Report the base rate under both definitions.",
+        footnote="The earlier version of this example quoted 66% and a nine-point swing, taken "
+                 "from the 100-case sample. Re-derived over the full corpus the figures are "
+                 "72.3% and 10.7 points. The sample was stratified on gender and WPI presence "
+                 "and was faithful on both, but drifted on dispute type, which nobody had "
+                 "stratified on - see 'The sample that was representative of the wrong things'.",
+    ),
+    dict(
+        example="Partial denial: when a category disagreement is a category error",
+        what_happened="liability_posture was extracted twice, by a text rule and by the LLM, into "
+                      "a binary: was liability itself in issue, or was it admitted and only "
+                      "entitlement disputed? The two methods disagreed on 711 of 2,385 cases "
+                      "(29.8%), and the disagreement was directional 4:1 - 494 cases where the "
+                      "LLM read denial and the rule read quantum-only, against 129 the other way.",
+        why_it_was_wrong="Neither extractor was misreading. In the dominant cell a consequential "
+                         "condition is claimed in 47.8% of cases against a 25.6% base rate, and "
+                         "the rule is quoting explicit concession language in 406 of the 494. "
+                         "Both are reading real words on the page: liability WAS admitted for the "
+                         "primary injury, and it WAS denied for the consequential condition, the "
+                         "treatment, or the impairment head. The category had no value for that, "
+                         "so each method rounded to a different side.",
+        why_it_matters="This is a gaming channel, not just a data-quality defect. Under the "
+                       "binary, an insurer that accepts the injury but denies every consequential "
+                       "condition, treatment and impairment head reads as 'quantum only' - the "
+                       "cooperative category. Deny in part, never in whole, and a conduct metric "
+                       "built on this field cannot see it. The field sits close to the metric's "
+                       "target concept, so the error propagates rather than washing out.",
+        how_it_was_caught="The cross-check was nearly suppressed: the marginals almost match "
+                          "(denied 46 v 49, quantum 47 v 40, procedural 7 v 11), so the field "
+                          "looked fine at the aggregate. Similar marginals with case-level "
+                          "disagreement is exactly the signature worth investigating, and the "
+                          "cross-tab - not the marginals - showed the direction.",
+        the_fix="Do not adjudicate a winner. Draw a reference set FROM the disagreement cells "
+                "(25/12/13 across the three, deliberately non-proportional), offer the labeller "
+                "the third value the schema cannot return, and cross the dominant cell on the "
+                "hypothesised mechanism and on rule strength so 'the category is wrong' and 'the "
+                "rule is weak' can be told apart. If it holds, liability_denied_in_part becomes a "
+                "third value.",
+        lesson="When two competent methods disagree about a category and both can quote the text, "
+               "suspect the category before you suspect the methods. A binary that cannot express "
+               "a real state of the world does not merely lose information - it creates a channel "
+               "for anyone who benefits from occupying that state.",
+    ),
+    dict(
+        example="The sample that was representative of the wrong things",
+        what_happened="A 100-case sample, drawn stratified on claimant gender and WPI presence, "
+                      "put liability_denied at 49%. The full corpus put it at 63%. Every figure "
+                      "quoted from that sample - including a worked example in this very sheet - "
+                      "inherited the gap.",
+        why_it_was_wrong="The stratification did its job: sample WPI presence 5.0% against a "
+                         "corpus 4.9%, male 59% against 60%. But nothing was stratified on "
+                         "dispute type, and dispute type drifted - Procedural 11% against 6.5%, "
+                         "Liability Dispute 24% against 28% - across categories whose denial "
+                         "rates span 8.3% to 97.8%. Re-weighting the corpus to the sample's "
+                         "dispute mix recovers 3 of the 14 points; the rest is an unlucky draw at "
+                         "roughly 2.2 standard errors.",
+        why_it_matters="A sample stratified on two variables is UNSTRATIFIED on every other one, "
+                       "and the ones that bite are whichever happen to correlate with the "
+                       "outcome. Nothing about the sample looked wrong: the variables anyone had "
+                       "thought to check reproduced the corpus almost exactly.",
+        how_it_was_caught="The same figure was computed over the full corpus and did not match. "
+                          "The sample's own cases were then re-scored in the full run and gave "
+                          "49% again, which ruled out run-to-run instability and left composition "
+                          "and luck.",
+        the_fix="Re-derive every sample-quoted figure from the full corpus once the full run "
+                "exists. Keep hand-labelled samples for what only a human can supply - a label - "
+                "and never for a base rate.",
+        lesson="Stratification buys representativeness on the variables you named and nothing "
+               "else. Check the marginals that matter for the CONCLUSION, not the ones you "
+               "happened to stratify on.",
     ),
 ]
 
@@ -2647,6 +2722,12 @@ def build_liability_adjudication_sample(extract, size=50, seed=20260815):
     reads denial and the rule reads quantum-only, against 129 the other way --
     and a consequential condition is claimed in 47.8% of that dominant cell
     against a 25.6% base rate. Both readers are quoting real language.
+
+    On the figure: the methods disagree on 711 of 2,385 cases, 29.8%. Commit
+    003a899, which is otherwise the record of why this cross-check was
+    reinstated, says 21% -- that was measured before the full run and is wrong.
+    It matters because 21% reads like a judgement call about a marginal field,
+    and 29.8% is the largest genuine method discrepancy in the workbook.
 
     That is the signature of PARTIAL denial: liability admitted for the primary
     injury, denied for the consequential condition, the treatment, or the
@@ -2834,6 +2915,29 @@ def score_reference_set(path):
                 cell_partial = cell_human.str.contains("in_part", case=False, na=False).sum()
                 parts.append(f"{cell}: n={len(rows)}, LLM right "
                              f"{(cell_human == cell_model).sum()}, partial {cell_partial}")
+                # The dominant cell holds two mechanisms, not one. Reading it as
+                # a single number is what the arms exist to prevent: if the
+                # human sides with the rule at a materially different rate where
+                # the rule had only the Nature field than where it quoted
+                # concession language, that is a weak rule and an
+                # under-specified category, separately, rather than one story.
+                if (cell == "llm_denied__rule_quantum"
+                        and "liability_posture_basis" in rows.columns
+                        and rule_column in rows.columns):
+                    cell_rule = rows[rule_column].astype(str).str.strip()
+                    arms = ["concession" if str(b) in CONCESSION_BASES else "nature_field_only"
+                            for b in rows["liability_posture_basis"]]
+                    for arm in ("concession", "nature_field_only"):
+                        pick = [a == arm for a in arms]
+                        if not any(pick):
+                            continue
+                        arm_human = cell_human[pick]
+                        sided_rule = (arm_human == cell_rule[pick]).sum()
+                        sided_llm = (arm_human == cell_model[pick]).sum()
+                        arm_partial = arm_human.str.contains("in_part", case=False,
+                                                             na=False).sum()
+                        parts.append(f"    arm {arm}: n={len(arm_human)}, sides with rule "
+                                     f"{sided_rule}, with LLM {sided_llm}, partial {arm_partial}")
             note = " | ".join(parts) + f" || confusions: {note}"
 
         report.append({
@@ -2851,23 +2955,91 @@ def freeze_definitional_set(extract):
 
     These are NOT extraction errors to be resolved. They are the
     mixed-versus-clean-win boundary, where two competent readers disagree
-    because the definition is underdetermined. Students arguing case by case
-    about whether each is a 'loss' is the exercise.
+    because the definition is underdetermined.
+
+    At full-corpus scale this changed in kind, not just in size. The set is 259
+    cases, 10.9% of the corpus, against an LLM-side 'mixed' rate of 10.7%: the
+    disagreement set and the partial-success population are effectively the same
+    object. 'mixed' appears on one side or the other in 92.7% of them. The
+    methods are not disagreeing about the facts of these cases -- they are
+    disagreeing about where partial success falls.
+
+    So the exercise is no longer arguing case by case about ten decisions. It is
+    characterising a boundary: which dispute types, postures and injury
+    categories cluster there, and how far the headline metric moves as the line
+    is redrawn (see summarise_definitional_shift).
+
+    The 19 cases that are a clean claimant/insurer flip with no 'mixed' on
+    either side are marked as such rather than dropped. They are a different
+    animal -- a disagreement about what happened, not about where the line sits
+    -- and leaving them unmarked in a boundary-characterisation exercise would
+    put 19 factual errors into a set whose whole premise is that nobody is
+    wrong.
     """
     if extract is None or "outcome_agreement" not in extract.columns:
         return pd.DataFrame()
     disputed = extract[extract["outcome_agreement"] == "differs"].copy()
     columns = [c for c in ("case_id", "case_name", "nature_of_case", "source_html_file",
                            "outcome", "outcome_rule", "outcome_reason", "result_text",
-                           "outcome_analysable", "catchwords")
+                           "outcome_analysable", "catchwords",
+                           # Carried so the boundary can be characterised rather
+                           # than merely argued over.
+                           "liability_posture", "primary_injury", "legal_complexity")
                if c in disputed.columns]
     frozen = disputed[columns].copy()
     frozen.insert(0, "set_name", "DEFINITIONAL_RISK_OUTCOME_V1")
+    if {"outcome", "outcome_rule"}.issubset(frozen.columns):
+        mixed_either = (frozen["outcome"].astype(str).eq("mixed")
+                        | frozen["outcome_rule"].astype(str).eq("mixed"))
+        frozen.insert(1, "disagreement_kind",
+                      ["boundary_partial_success" if flag else "clean_flip"
+                       for flag in mixed_either])
     frozen["question_for_students"] = (
-        "Is this a win for the worker, a loss, or neither? The two extractors disagreed. "
-        "Decide, state the rule you applied, and apply that rule consistently to the rest of "
-        "the set.")
+        "Where does partial success fall? These are not extraction errors: in 92.7% of them one "
+        "reader called the case 'mixed' and the other resolved it to a side. Do not argue them "
+        "one at a time. Characterise the boundary - which dispute types, postures and injury "
+        "categories cluster here - then state a rule for partial success, apply it to the whole "
+        "set, and report how far the headline success rate moves under your rule versus the "
+        "alternative. Rows marked clean_flip are the exception: there the two readers disagree "
+        "about what happened, so treat them separately.")
     return frozen
+
+
+def summarise_definitional_shift(extract):
+    """How far the headline metric moves as the partial-success line is redrawn.
+
+    The point students need is not that a boundary exists but that it is worth
+    something. Reported overall and by dispute type, because the boundary is not
+    evenly distributed: Permanent Impairment is 30.1% of the disagreement set
+    against 15.8% of the corpus, so a definitional change hits some dispute
+    types roughly twice as hard as others.
+    """
+    if extract is None or not len(extract):
+        return pd.DataFrame()
+    if not {"outcome", "outcome_rule"}.issubset(extract.columns):
+        return pd.DataFrame()
+
+    def rates(frame):
+        llm, rule = frame["outcome"].astype(str), frame["outcome_rule"].astype(str)
+        mixed = llm.eq("mixed")
+        return {
+            "n": len(frame),
+            # 'mixed counts as a loss' is the strict reading; 'mixed counts as a
+            # win' is the generous one. The gap is the definitional exposure.
+            "worker_success_strict_%": round(100 * llm.eq("claimant").mean(), 1),
+            "worker_success_generous_%": round(100 * (llm.eq("claimant") | mixed).mean(), 1),
+            "definitional_swing_points": round(100 * mixed.mean(), 1),
+            "llm_mixed_%": round(100 * mixed.mean(), 1),
+            "rule_mixed_%": round(100 * rule.eq("mixed").mean(), 1),
+            "methods_differ_%": round(100 * llm.ne(rule).mean(), 1),
+        }
+
+    rows = [dict(scope="ALL", **rates(extract))]
+    if "nature_of_case" in extract.columns:
+        for nature, frame in extract.groupby(extract["nature_of_case"].astype(str)):
+            if len(frame) >= 25:
+                rows.append(dict(scope=nature, **rates(frame)))
+    return pd.DataFrame(rows).sort_values("n", ascending=False)
 
 
 def build_validation_worksheet(extract, size=40, seed=20260815):
@@ -2909,12 +3081,15 @@ def write_reference_sets(path, extract, size=50, seed=20260815, prefill=False):
         return {}
     worksheets = build_reference_worksheets(extract, size=size, seed=seed, prefill=prefill)
     frozen = freeze_definitional_set(extract)
+    shift = summarise_definitional_shift(extract)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         for field, sheet in worksheets.items():
             sheet.to_excel(writer, sheet_name=field[:31], index=False)
         if len(frozen):
             frozen.to_excel(writer, sheet_name="definitional_outcome_set", index=False)
+        if len(shift):
+            shift.to_excel(writer, sheet_name="definitional_metric_shift", index=False)
         pd.DataFrame([
             {"instruction": "Label HUMAN_<field> WITHOUT reading MODEL_<field> (rightmost "
                             "column) - it is placed last so you can hide it. Anchoring on the "

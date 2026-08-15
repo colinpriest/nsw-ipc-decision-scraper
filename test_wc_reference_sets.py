@@ -149,6 +149,102 @@ def test_blank_labels_are_skipped_rather_than_scored_as_errors(tmp_path):
     assert row["labelled"] == 4
 
 
+def _outcomes(boundary=240, flips=19, agreeing=2126):
+    """The full-corpus shape: a disagreement set that is almost entirely the
+    partial-success population, plus a small tail of genuine flips."""
+    rows = []
+    for i in range(boundary):
+        rows.append({"case_id": f"B{i}", "outcome": "mixed",
+                     "outcome_rule": "claimant" if i % 2 else "insurer",
+                     "outcome_agreement": "differs", "nature_of_case": "Permanent Impairment"})
+    for i in range(flips):
+        rows.append({"case_id": f"F{i}", "outcome": "claimant", "outcome_rule": "insurer",
+                     "outcome_agreement": "differs", "nature_of_case": "Liability Dispute"})
+    for i in range(agreeing):
+        rows.append({"case_id": f"A{i}", "outcome": "claimant", "outcome_rule": "claimant",
+                     "outcome_agreement": "same", "nature_of_case": "Medical Dispute"})
+    return pd.DataFrame(rows)
+
+
+def test_clean_flips_are_marked_not_dropped():
+    """A boundary-characterisation set whose premise is 'nobody is wrong' must
+    not quietly carry cases where somebody is."""
+    frozen = wc.freeze_definitional_set(_outcomes())
+    assert len(frozen) == 259
+    kinds = frozen["disagreement_kind"].value_counts()
+    assert kinds["boundary_partial_success"] == 240
+    assert kinds["clean_flip"] == 19
+
+
+def test_the_whole_disagreement_set_is_kept():
+    """259 cases, not a curated draw from them."""
+    frozen = wc.freeze_definitional_set(_outcomes())
+    assert set(frozen["case_id"]) == set(_outcomes().query("outcome_agreement == 'differs'")
+                                         ["case_id"])
+
+
+def test_the_frozen_set_carries_what_the_boundary_is_characterised_by():
+    extract = _outcomes()
+    extract["liability_posture"] = "liability_denied"
+    extract["primary_injury"] = "back_spine"
+    frozen = wc.freeze_definitional_set(extract)
+    for column in ("nature_of_case", "liability_posture", "primary_injury"):
+        assert column in frozen.columns
+
+
+def test_the_metric_shift_is_reported_not_left_as_an_assertion():
+    shift = wc.summarise_definitional_shift(_outcomes())
+    overall = shift[shift["scope"] == "ALL"].iloc[0]
+    # 240 mixed of 2385 -> the swing between counting mixed as loss vs win.
+    assert overall["definitional_swing_points"] == 10.1
+    assert round(overall["worker_success_generous_%"]
+                 - overall["worker_success_strict_%"], 1) == overall["definitional_swing_points"]
+    # Broken out by dispute type, because the boundary is not evenly spread.
+    assert "Permanent Impairment" in set(shift["scope"])
+
+
+def test_the_dominant_cell_is_scored_by_arm_not_as_one_number(tmp_path):
+    """If the human sides with the rule at a different rate where the rule had
+    only the Nature field, that is two mechanisms, not one story."""
+    sheets = wc.build_reference_worksheets(_extract(), size=50)
+    sheet = sheets["liability_posture"].copy()
+    sheet["HUMAN_liability_posture"] = [
+        "liability_denied_in_part" if cell == "llm_denied__rule_quantum"
+        else "liability_denied" for cell in sheet["_cell"]]
+    path = tmp_path / "sets.xlsx"
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        sheet.to_excel(writer, sheet_name="liability_posture", index=False)
+
+    note = wc.score_reference_set(path).iloc[0]["note"]
+    assert "arm concession:" in note
+    assert "arm nature_field_only:" in note
+
+
+def test_the_stale_disagreement_figure_is_corrected_in_source():
+    """21% was measured pre-full-run and makes the field look marginal; the
+    commit that recorded it cannot be edited, so the correction lives here."""
+    assert "29.8%" in wc.build_liability_adjudication_sample.__doc__
+    assert "003a899" in wc.build_liability_adjudication_sample.__doc__
+
+
+def test_the_gaming_vector_is_tracked_source_not_just_prose():
+    examples = {e["example"] for e in wc.WORKED_EXAMPLES}
+    assert any("Partial denial" in name for name in examples)
+    partial = next(e for e in wc.WORKED_EXAMPLES if "Partial denial" in e["example"])
+    # The point is the channel, not merely the disagreement.
+    assert "cooperative category" in partial["why_it_matters"]
+    assert set(partial) >= {"what_happened", "why_it_was_wrong", "why_it_matters",
+                            "how_it_was_caught", "the_fix", "lesson"}
+
+
+def test_no_worked_example_still_quotes_the_hundred_case_sample():
+    """Sample-derived base rates were the thing the sample could not supply."""
+    for example in wc.WORKED_EXAMPLES:
+        if example["example"].startswith("The sample"):
+            continue
+        assert "66%" not in example.get("what_happened", "")
+
+
 def test_a_frame_without_the_rule_column_yields_no_sheet_rather_than_a_bad_one():
     frame = _extract().drop(columns=["liability_posture_rule"])
     assert wc.build_liability_adjudication_sample(frame, size=50).empty
