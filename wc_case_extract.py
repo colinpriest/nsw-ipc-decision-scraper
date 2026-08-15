@@ -80,6 +80,13 @@ WC_SCHEMA_VERSION = 8
 # is the Diab failure mode with the docs as the victim. An additive pass adds
 # fields without disturbing any of it, at roughly a third of the cost.
 WC_CONDUCT_VERSION = 1
+
+# The relief-degree pilot is versioned apart from the conduct pass for the same
+# reason the conduct pass is versioned apart from the main schema, applied one
+# level down: conduct_finding and denial_scope work and cost $46 to produce, so
+# a field still being piloted must not be able to invalidate them. Bumping this
+# re-runs one ordinal and nothing else.
+WC_RELIEF_VERSION = 1
 LLM_CACHE_FILE = os.path.join(OUTPUT_ROOT, "wc_llm_cache.json")
 DICTIONARY_XLSX = os.path.join("docs", "wc_data_dictionary.xlsx")
 # Worksheets carry case names and catchwords, so they are written under
@@ -619,6 +626,75 @@ WC_CONDUCT_SYSTEM_INSTRUCTION = (
     "not every remedy mentioned in the application.\n"
     "- Quote verbatim in the evidence fields, and leave them empty rather than paraphrasing."
 )
+
+
+class ReliefGrantedEnum(str, Enum):
+    """How much of what the worker pressed was actually granted.
+
+    Replaces the head-count ratio, which measured the wrong granularity: 64.4%
+    of this corpus presses a SINGLE head, so a heads_succeeded/heads_claimed
+    ratio can only ever be 0 or 1, and 154 of the 255 'mixed' decisions came
+    back at 1.0. Mixed in workers compensation usually means partial success
+    WITHIN one head - a reduced period of weekly payments, some treatment
+    approved and some refused - which head-counting cannot see.
+
+    This is a degree judgment rather than a fact, which is why it is piloted
+    before it is bought: soft ordinals are where run-to-run variance
+    concentrates, and an unstable ordinal yields a sensitivity curve made of
+    noise.
+    """
+    fully_granted = "fully_granted"
+    substantially_granted = "substantially_granted"
+    partly_granted = "partly_granted"
+    minimally_granted = "minimally_granted"
+    refused = "refused"
+    not_determinable = "not_determinable"
+
+
+class WCReliefSchema(BaseModel):
+    """Pilot schema: one ordinal and its evidence."""
+    relief_granted_degree: ReliefGrantedEnum = Field(description=(
+        "How much of what the worker actually pressed did the Member grant, counting partial "
+        "success WITHIN a head and not only whole heads won or lost. 'fully_granted' = "
+        "substantially everything sought. 'substantially_granted' = the great majority, with a "
+        "minor reduction or carve-out. 'partly_granted' = a real split, roughly half. "
+        "'minimally_granted' = a token or small part only. 'refused' = nothing of substance. "
+        "'not_determinable' where the orders do not permit the comparison - use it rather than "
+        "guessing."))
+    relief_granted_evidence: str = Field(description=(
+        "Short verbatim quote from the ORDERS supporting the degree. EMPTY if not determinable."))
+
+
+WC_RELIEF_SYSTEM_INSTRUCTION = (
+    "You judge how much of the relief a worker pressed for was granted by the NSW Personal Injury "
+    "Commission, from the decision text.\n\n"
+    "Rules that matter:\n"
+    "- Compare what was ORDERED against what was actually PRESSED for decision, not against "
+    "everything ever mentioned in the application.\n"
+    "- Partial success within a single head counts. A claim for weekly payments over three years "
+    "allowed for eight months is 'partly_granted' or 'minimally_granted', not 'fully_granted'.\n"
+    "- Concessions the worker made before the hearing are not losses: judge against what remained "
+    "in issue.\n"
+    "- 'not_determinable' is a real answer and is preferred to a guess. Use it where the orders "
+    "are procedural, remit the matter, or do not state what was sought.\n"
+    "- Quote verbatim from the orders in the evidence field."
+)
+
+
+def extract_wc_relief_llm(extractor, source_text, context=None, seed=None):
+    """Run the relief-degree pilot on one decision. Returns (parsed, usage, error)."""
+    if not source_text:
+        return None, None, "empty source"
+    user_content = (
+        "Judge how much of the relief pressed for was granted in the decision below.\n\n"
+        "---\n"
+        f"{build_wc_context(source_text)}\n"
+        "---\n"
+    )
+    return _parse_pinned(
+        extractor, WC_RELIEF_SYSTEM_INSTRUCTION, user_content, WCReliefSchema,
+        context=context, reasoning_effort=WC_REASONING_EFFORT, seed=seed,
+    )
 
 
 def extract_wc_conduct_llm(extractor, source_text, context=None, seed=None):
@@ -2383,7 +2459,14 @@ FIELD_DOCS = [
      "Whether the Member remarked on the INSURER's conduct of the claim. Three-way on purpose: "
      "silence and express approval are opposite evidence for convergent validity and identical "
      "under a boolean. Losing is not criticism -- an insurer can lose with impeccable conduct on "
-     "fresh medical evidence, or win having handled the matter badly."),
+     "fresh medical evidence, or win having handled the matter badly. MEASURED: criticism_made "
+     "5.7%, considered_not_criticised 2.1%, not_addressed 92.1%. Claimant success runs 87.6% / "
+     "62.7% / 71.6% across those three, so the arms fall on BOTH sides of baseline. "
+     "ENDOGENEITY CAVEAT, which anyone using this as a validation target must state: the conduct "
+     "remark and the outcome are recorded in the same document by the same person, so criticism "
+     "is partly downstream of the finding rather than independent of it. The "
+     "considered_not_criticised arm is a partial answer -- pure endogeneity would not place it "
+     "BELOW the not_addressed baseline -- but it is a mitigation, not a refutation."),
     ("conduct_scope", "conduct", "text", "llm_second_pass",
      "semicolon-separated: reasons_adequacy / timeliness / investigation_proportionality / "
      "surveillance / failure_to_consider_evidence / defective_notice / other_conduct",
@@ -2830,12 +2913,16 @@ WORKED_EXAMPLES = [
                          "primary injury, and it WAS denied for the consequential condition, the "
                          "treatment, or the impairment head. The category had no value for that, "
                          "so each method rounded to a different side.",
-        why_it_matters="This is a gaming channel, not just a data-quality defect. Under the "
-                       "binary, an insurer that accepts the injury but denies every consequential "
-                       "condition, treatment and impairment head reads as 'quantum only' - the "
-                       "cooperative category. Deny in part, never in whole, and a conduct metric "
-                       "built on this field cannot see it. The field sits close to the metric's "
-                       "target concept, so the error propagates rather than washing out.",
+        why_it_matters="This is a gaming channel, not just a data-quality defect, and it is now "
+                       "MEASURED rather than inferred. Extracting what was denied (denial_scope) "
+                       "shows that of the 748 cases the binary reads as 'quantum only' - the "
+                       "cooperative category - 51.3% carry a recorded denial of a consequential "
+                       "condition, a treatment or an impairment head, and 49.1% denied something "
+                       "without denying the primary injury. Corpus-wide the pattern covers 828 "
+                       "cases, 34.7%. Deny in part, never in whole, and a conduct metric built on "
+                       "this field cannot see it: half of what it scores as cooperative contains "
+                       "a denial. The field sits close to the metric's target concept, so the "
+                       "error propagates rather than washing out.",
         how_it_was_caught="The cross-check was nearly suppressed: the marginals almost match "
                           "(denied 46 v 49, quantum 47 v 40, procedural 7 v 11), so the field "
                           "looked fine at the aggregate. Similar marginals with case-level "
@@ -2847,6 +2934,15 @@ WORKED_EXAMPLES = [
                 "hypothesised mechanism and on rule strength so 'the category is wrong' and 'the "
                 "rule is weak' can be told apart. If it holds, liability_denied_in_part becomes a "
                 "third value.",
+        footnote="A hypothesis died here and it is worth keeping the corpse. The prediction was "
+                 "that partial denial would be CONCENTRATED in the 494-case disagreement cell, "
+                 "and it is not: inside that cell primary injury is denied 59.1% of the time - "
+                 "the LLM's reading backed against the rule's, so rule weakness - and the "
+                 "partial-not-primary signature is 36.6% against a 32.0% baseline on rows where "
+                 "the methods AGREE. Partial denial is a property of the category corpus-wide, "
+                 "not of where the two methods disagree. The finding survived losing its "
+                 "mechanism, and got larger: the channel does not need the disagreement to "
+                 "exist.",
         lesson="When two competent methods disagree about a category and both can quote the text, "
                "suspect the category before you suspect the methods. A binary that cannot express "
                "a real state of the world does not merely lose information - it creates a channel "
@@ -2908,6 +3004,37 @@ WORKED_EXAMPLES = [
                "estimate token cost from the corpus LENGTH DISTRIBUTION, never from a "
                "small-sample per-case average - is about getting the unit price right; this one "
                "is about knowing how many units your design quietly ordered.",
+    ),
+    dict(
+        example="The field that was specified at the wrong granularity",
+        what_happened="claimant_success_degree was defined as heads_succeeded / heads_claimed, to "
+                      "turn the definitional question from a two-point comparison into a "
+                      "sensitivity curve. Extracted over the full corpus at a cost of $46, it "
+                      "came back flat: 64.4% of decisions press a SINGLE head, so the ratio can "
+                      "only be 0 or 1, and 154 of the 255 'mixed' decisions scored 1.0.",
+        why_it_was_wrong="The specification assumed 'mixed' means winning some heads and losing "
+                         "others. In workers compensation it usually means partial success WITHIN "
+                         "one head - a reduced period of weekly payments, some treatment approved "
+                         "and some refused. The field measured a real quantity accurately; it was "
+                         "the wrong quantity.",
+        why_it_matters="Nothing in the schema, the prompt or the validation would have caught "
+                       "this. The field is well defined, the model answered it correctly, and "
+                       "every value is defensible. It fails only against its PURPOSE, and that "
+                       "failure is invisible until you look at the distribution - where it is "
+                       "obvious at a glance, and would have been obvious in 100 cases for about "
+                       "$2 rather than 2,385 for $46.",
+        how_it_was_caught="Cross-tabulating the new field against the outcome it was meant to "
+                          "refine. A field that disagrees with the thing it is supposed to be a "
+                          "finer-grained version of is either wrong or measuring something else.",
+        the_fix="Pilot the DISTRIBUTION of a derived field before buying the full pass, and pilot "
+                "it with repeated votes where the field is a judgment rather than a fact. The "
+                "replacement here - an ordinal for within-head partiality - carries the larger "
+                "risk, because degree judgments are where run-to-run variance concentrates and an "
+                "unstable ordinal yields a sensitivity curve made of noise.",
+        lesson="Specification errors are invisible in the schema and obvious in the histogram. "
+               "Validation asks whether the field is right; only the distribution asks whether it "
+               "is USEFUL, and the two come apart exactly when a field is derived rather than "
+               "observed.",
     ),
 ]
 
@@ -3784,14 +3911,141 @@ def cached_llm_extract(extractor, cache, url, text, context=None, lock=None):
             # still current, and the additive pass would cost full price every
             # time the main schema moved.
             previous = cache.get(url) or {}
-            for key in ("_conduct", "_conduct_version"):
-                if key in previous:
-                    record[key] = previous[key]
-            # _votes is NOT carried: the stability votes are values of
-            # main-schema fields, so a re-extraction makes them stale.
+            # Carry every side-pass's data, not a named list of them: a new pass
+            # added later would otherwise be silently dropped by an old write,
+            # which is the coupling this whole design exists to prevent.
+            # _votes is the one exception -- those are values of MAIN-schema
+            # fields, so a re-extraction makes them stale rather than reusable.
+            for key, value in previous.items():
+                if key.startswith("_") and key not in ("_votes", "_wc_schema_version"):
+                    record[key] = value
             cache[url] = record
         _write() if lock is None else _with(lock, _write)
     return parsed, error, False
+
+
+RELIEF_PILOT_SEEDS = (20260815, 20260816, 20260817)
+
+
+def cached_relief_votes(extractor, cache, url, text, context=None, lock=None,
+                        seeds=RELIEF_PILOT_SEEDS):
+    """Run the relief ordinal under several seeds, memoised per (url, seed).
+
+    Returns the list of votes. The pilot needs both answers this produces --
+    what the distribution looks like and whether it holds still -- and one set
+    of calls gives both, so there is no cheaper design that answers the
+    question.
+    """
+    def _read():
+        return ((cache.get(url) or {}).get("_relief_votes") or {})
+
+    stored = _read() if lock is None else _with(lock, _read)
+    votes = []
+    for seed in seeds:
+        key = str(seed)
+        if stored.get(key) is not None:
+            votes.append(stored[key])
+            continue
+        if extractor is None:
+            continue
+        parsed, _usage, _error = extract_wc_relief_llm(
+            extractor, text, context=f"{context} seed={seed}", seed=seed)
+        if parsed is None:
+            continue
+        value = parsed.relief_granted_degree.value
+
+        def _write():
+            slot = cache.setdefault(url, {})
+            slot.setdefault("_relief_votes", {})[key] = value
+            slot["_relief_version"] = WC_RELIEF_VERSION
+        _write() if lock is None else _with(lock, _write)
+        votes.append(value)
+    return votes
+
+
+def run_relief_pilot(args, records, file_index, extractor, llm_cache, cache_lock):
+    """Pilot the relief ordinal and report. Writes nothing but the cache.
+
+    Kept off the workbook path on purpose: a field under test must not be able
+    to land in the deliverable, and a pilot that overwrote wc_case_extract.xlsx
+    with a 100-row sample would be a far more expensive mistake than the one it
+    is guarding against.
+    """
+    # A seeded RANDOM draw, not records[:N]. Taking the head of the frame is
+    # the failure this repo already documents: the first N rows are in citation
+    # order, and any variable correlated with time or court order rides along
+    # unnoticed. The first version of this pilot did exactly that and drew a
+    # sample carrying 15% 'mixed' against a 10.7% corpus rate -- an
+    # over-representation of precisely the cases the ordinal is meant to
+    # spread, which flatters the result it was testing.
+    frame = pd.DataFrame(records)
+    take = min(args.relief_pilot, len(frame))
+    sample = frame.sample(n=take, random_state=args.seed).to_dict("records")
+    print(f"\nRelief-degree pilot: {len(sample)} cases x {len(RELIEF_PILOT_SEEDS)} votes "
+          f"(random, seed {args.seed})")
+
+    def vote(csv_row):
+        url = csv_row.get("URL")
+        case_id, year, number = case_id_from_url(url)
+        entry = file_index.get((year, number), {"canonical": None, "all": []})
+        text = load_text(url, entry["canonical"], args.decisions, args.cache)
+        if not text:
+            return []
+        return cached_relief_votes(extractor, llm_cache, url, text,
+                                   context=case_id, lock=cache_lock)
+
+    workers = max(1, min(args.workers, len(sample)))
+    all_votes = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for votes in pool.map(vote, sample):
+            all_votes.append(votes)
+
+    save_llm_cache(args.llm_cache, llm_cache)
+    report = summarise_relief_pilot(all_votes)
+
+    print(f"\nCases with >=2 votes: {report['cases']}")
+    print("\nDistribution (first vote):")
+    for value, count in report["distribution"].items():
+        share = 100 * count / report["cases"] if report["cases"] else 0
+        print(f"  {value:<24} {count:>4}  {share:5.1f}%")
+    print(f"\n  distinct values used   {report['distinct_values']}")
+    print(f"  largest bucket         {report['largest_bucket_%']}%")
+    print("\nRun-to-run stability:")
+    print(f"  unanimous              {report['unanimous_%']}%")
+    print(f"  majority only          {report['majority_only_%']}%")
+    print(f"  no majority            {report['no_majority_%']}%")
+    print("\nThe two failure modes this is testing for:")
+    print("  - piles up on one value  -> cannot carry a sensitivity curve however accurate")
+    print("  - moves between runs     -> the curve would be made of noise")
+    print(f"\nLLM spend: ${COST.total_cost():.4f} over {COST.calls} calls")
+    return report
+
+
+def summarise_relief_pilot(all_votes):
+    """The two questions the pilot exists to answer, and nothing else.
+
+    Deliberately reports the DISTRIBUTION and the STABILITY rather than an
+    accuracy: there is no ground truth here, and the failure modes that killed
+    the head-count ratio are both visible without one. A field that piles up on
+    one value cannot carry a sensitivity curve however accurate it is, and an
+    ordinal that moves between runs produces a curve made of noise.
+    """
+    complete = [votes for votes in all_votes if len(votes) >= 2]
+    distribution = Counter(votes[0] for votes in complete)
+    unanimous = sum(1 for votes in complete if len(set(votes)) == 1)
+    majority = sum(1 for votes in complete
+                   if len(set(votes)) > 1 and Counter(votes).most_common(1)[0][1] >= 2)
+    scattered = len(complete) - unanimous - majority
+    top_share = (100 * max(distribution.values()) / len(complete)) if complete else 0.0
+    return {
+        "cases": len(complete),
+        "distribution": dict(distribution.most_common()),
+        "distinct_values": len(distribution),
+        "largest_bucket_%": round(top_share, 1),
+        "unanimous_%": round(100 * unanimous / len(complete), 1) if complete else 0.0,
+        "majority_only_%": round(100 * majority / len(complete), 1) if complete else 0.0,
+        "no_majority_%": round(100 * scattered / len(complete), 1) if complete else 0.0,
+    }
 
 
 def cached_conduct_extract(extractor, cache, url, text, context=None, lock=None):
@@ -3976,6 +4230,10 @@ def main():
                              "3x on the ~9%% that disagree.")
     parser.add_argument("--refresh-llm", action="store_true",
                         help="Ignore cached LLM results and re-extract")
+    parser.add_argument("--relief-pilot", type=int, metavar="N",
+                        help="Pilot the relief_granted_degree ordinal on N cases with 3 votes "
+                             "each, report the distribution and run-to-run stability, and exit. "
+                             "Writes nothing but the cache. ~$0.06/case.")
     parser.add_argument("--conduct-pass", action="store_true",
                         help="Run the additive second pass: denial scope, success granularity "
                              "and insurer-conduct findings. Versioned separately from the main "
@@ -4062,6 +4320,10 @@ def main():
     cache_lock = threading.Lock()
     counters = Counter()
     records = [record.to_dict() for _, record in selected.iterrows()]
+
+    if args.relief_pilot:
+        run_relief_pilot(args, records, file_index, extractor, llm_cache, cache_lock)
+        return
 
     def process(csv_row):
         """One case end to end. Runs in a worker thread: the HTML parse is

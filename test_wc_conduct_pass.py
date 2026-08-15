@@ -236,6 +236,59 @@ def test_the_conduct_vocabulary_is_the_regulators():
             "failure_to_consider_evidence"} <= values
 
 
+def test_a_new_side_pass_is_carried_across_a_main_re_extraction():
+    """The carry-over is generic, not a named list: a pass added later must not
+    be silently dropped by a write that predates it."""
+    cache = {"u1": dict(_cache_entry(main_version=wc.WC_SCHEMA_VERSION - 1),
+                        _relief_votes={"1": "partly_granted"},
+                        _relief_version=wc.WC_RELIEF_VERSION)}
+    _force_main_reextraction(cache)
+    assert cache["u1"]["_relief_votes"] == {"1": "partly_granted"}
+    assert cache["u1"]["_conduct_version"] == wc.WC_CONDUCT_VERSION
+
+
+def test_the_pilot_reports_the_two_failure_modes_it_exists_to_catch():
+    """A field that piles up cannot carry a curve however accurate; a field
+    that moves between runs makes the curve out of noise."""
+    piled_and_stable = [["fully_granted"] * 3 for _ in range(20)]
+    report = wc.summarise_relief_pilot(piled_and_stable)
+    assert report["largest_bucket_%"] == 100.0 and report["distinct_values"] == 1
+    assert report["unanimous_%"] == 100.0
+
+    spread_but_unstable = [["fully_granted", "partly_granted", "refused"] for _ in range(10)]
+    report = wc.summarise_relief_pilot(spread_but_unstable)
+    assert report["no_majority_%"] == 100.0
+
+
+def test_the_pilot_ignores_cases_that_could_not_be_voted():
+    report = wc.summarise_relief_pilot([[], ["fully_granted"], ["refused", "refused"]])
+    assert report["cases"] == 1
+
+
+def test_the_relief_pilot_is_versioned_apart_from_the_conduct_pass():
+    """It is still being piloted; it must not be able to invalidate the $46 of
+    conduct data that works."""
+    cache = {"u1": _cache_entry()}
+    # A stale relief version must leave the conduct record entirely alone.
+    cache["u1"]["_relief_version"] = wc.WC_RELIEF_VERSION - 1
+    parsed, _error, was_cached = wc.cached_conduct_extract(None, cache, "u1", "text")
+    assert was_cached and parsed is not None
+    # ...and vice versa: the two version keys are independent, not aliases.
+    stale_conduct = {"u1": _cache_entry(conduct_version=wc.WC_CONDUCT_VERSION - 1)}
+    stale_conduct["u1"]["_relief_votes"] = {"1": "refused"}
+    assert wc.cached_relief_votes(None, stale_conduct, "u1", "text",
+                                  seeds=(1,)) == ["refused"]
+
+
+def test_the_endogeneity_caveat_is_recorded_where_a_consumer_will_hit_it():
+    """A validation target whose limitation lives only in a conversation is a
+    validation target whose limitation will not be stated."""
+    entry = next(row for row in wc.FIELD_DOCS if row[0] == "conduct_finding")
+    definition = entry[-1]
+    assert "ENDOGENEITY" in definition
+    assert "same document by the same person" in definition
+
+
 def test_every_new_column_is_documented():
     """The dictionary asserts coverage; a new column with no entry comes back
     as UNDOCUMENTED rather than being silently omitted."""
