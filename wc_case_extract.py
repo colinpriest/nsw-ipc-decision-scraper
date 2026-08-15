@@ -2698,6 +2698,25 @@ CONCESSION_BASES = {"liability_expressly_accepted", "both_signals_concession_fir
                     "explicit_concession"}
 
 
+def dispute_group(nature):
+    """Collapse nature_of_case to the groups the partial-denial mechanism
+    distinguishes.
+
+    Liability, impairment and medical are kept apart because the outcome lift
+    given a posture disagreement differs sharply across them (x2.26, x1.15,
+    x1.11). Everything else is pooled: those types are either too small to
+    stratify on or show no lift worth separating.
+    """
+    nature = str(nature).strip().lower()
+    if "liability" in nature:
+        return "liability"
+    if "impairment" in nature:
+        return "impairment"
+    if "medical" in nature:
+        return "medical"
+    return "other"
+
+
 def liability_disagreement_cell(llm, rule):
     """Which rule-vs-LLM disagreement cell a row sits in, or None if they agree."""
     llm, rule = str(llm).strip(), str(rule).strip()
@@ -2734,13 +2753,29 @@ def build_liability_adjudication_sample(extract, size=50, seed=20260815):
     impairment head. So this sample's job is not to pick a winner between the
     methods; it is to test whether the category needs a third value.
 
-    The dominant cell is therefore crossed on two axes at once:
-      - consequential_condition_claimed, the hypothesised mechanism;
+    The dominant cell is therefore crossed on two axes:
+      - dispute type, because that is where the MECHANISM varies. Conditioning
+        the outcome on the posture disagreement gives a lift of x2.26 in
+        liability disputes but only x1.15 in permanent impairment: where denial
+        should be explicit, a posture disagreement more than doubles the mixed
+        rate, which reads as genuine partial liability producing partial
+        outcome; where disagreement is commonest it barely moves the outcome,
+        which reads as category-and-rule failure instead. Two mechanisms, and
+        they separate on dispute type.
       - whether the rule had explicit concession language or only the Nature
         field (88 of the 494 are nature_field alone, which is a weak-rule
         failure rather than an under-specified category).
-    The two competing explanations separate on exactly that cross, which a
-    single-axis split would blur.
+
+    consequential_condition_claimed was the first axis tried and is deliberately
+    NOT stratified on now. It sits at 47.8% inside this cell, so a random draw
+    represents it comfortably; it is recorded per case and can be tested after
+    the fact. Liability Dispute is 25% of the cell and is the diagnostic
+    stratum, and an unstratified draw gave it THREE cases out of 25 -- enough to
+    load the sample with the dispute types whose answer is likely 'rule failure'
+    and then read that back as a finding about the mechanism. Stratify the rare
+    diagnostic variable; let the near-balanced one fall out.
+
+    Three axes will not fit in 25 slots. This is the trade, made explicitly.
     """
     if extract is None or not len(extract):
         return pd.DataFrame()
@@ -2782,13 +2817,12 @@ def build_liability_adjudication_sample(extract, size=50, seed=20260815):
             continue
         cell = disagreements[disagreements["_cell"] == name]
         if name == "llm_denied__rule_quantum":
-            consequential = cell.get("consequential_condition_claimed",
-                                     pd.Series("Unknown", index=cell.index)).astype(str)
+            nature = cell.get("nature_of_case", pd.Series("", index=cell.index)).astype(str)
             basis = cell.get("liability_posture_basis",
                              pd.Series("", index=cell.index)).astype(str)
             cell = cell.assign(_substratum=[
-                f"{c}|{'concession' if b in CONCESSION_BASES else 'nature_field_only'}"
-                for c, b in zip(consequential, basis)])
+                f"{dispute_group(n)}|{'concession' if b in CONCESSION_BASES else 'nature_field_only'}"
+                for n, b in zip(nature, basis)])
             chunk, _ = stratified_sample(cell, "_substratum", take, seed)
             chunk = chunk.drop(columns=["_substratum"])
         else:
@@ -2938,6 +2972,23 @@ def score_reference_set(path):
                                                              na=False).sum()
                         parts.append(f"    arm {arm}: n={len(arm_human)}, sides with rule "
                                      f"{sided_rule}, with LLM {sided_llm}, partial {arm_partial}")
+                    # The localisation test. Pooling these would let the dispute
+                    # types whose answer is 'rule failure' -- medical and
+                    # impairment, half of the disagreements -- speak for the
+                    # ones where partial denial looks like the real cause.
+                    if "nature_of_case" in rows.columns:
+                        groups = [dispute_group(n) for n in rows["nature_of_case"]]
+                        for group in ("liability", "impairment", "medical", "other"):
+                            pick = [g == group for g in groups]
+                            if not any(pick):
+                                continue
+                            group_human = cell_human[pick]
+                            group_partial = group_human.str.contains("in_part", case=False,
+                                                                     na=False).sum()
+                            parts.append(
+                                f"    dispute {group}: n={len(group_human)}, partial "
+                                f"{group_partial} ({round(100 * group_partial / len(group_human))}%)"
+                                f", sides with rule {(group_human == cell_rule[pick]).sum()}")
             note = " | ".join(parts) + f" || confusions: {note}"
 
         report.append({
@@ -3522,7 +3573,8 @@ def main():
         for _, row in report.iterrows():
             accuracy = "n/a" if pd.isna(row["accuracy"]) else f"{row['accuracy']}%"
             print(f"  {row['field']:<22} {accuracy:>7}  (n={row['labelled']})  [{row['design']}]")
-            print(f"  {'':<22} {row['note']}")
+            for part in str(row["note"]).split(" | "):
+                print(f"  {'':<22} {part}")
         return
 
     frame = pd.read_csv(args.csv, low_memory=False)

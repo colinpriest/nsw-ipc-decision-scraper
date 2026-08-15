@@ -15,23 +15,33 @@ column revealing either extractor's answer may sit ahead of the human's column.
     python test_wc_reference_sets.py      # or: pytest
 """
 
+from collections import Counter
+
 import pandas as pd
 
 import wc_case_extract as wc
+
+# The dominant cell's real dispute mix: impairment 152, medical 129,
+# liability 124, other 89. Liability is the diagnostic stratum and the
+# scarcest of the three that matter.
+DOMINANT_NATURES = (["Permanent Impairment"] * 152 + ["Medical Dispute"] * 129
+                    + ["Liability Dispute"] * 124 + ["Statutory Benefits Dispute"] * 89)
 
 
 def _extract(denied_quantum=494, quantum_denied=129, procedural=77, agreeing=1674):
     """A frame with the full-corpus disagreement structure, in miniature."""
     rows = []
 
-    def add(count, llm, rule, consequential="No", basis="explicit_concession"):
+    def add(count, llm, rule, consequential="No", basis="explicit_concession",
+            natures=None):
         for i in range(count):
             n = len(rows)
             rows.append({
                 "case_id": f"C{n:05d}",
                 "case_name": f"Worker v Employer No {n}",
                 "source_html_file": f"decision_{n}.html",
-                "nature_of_case": "Claim for permanent impairment compensation",
+                "nature_of_case": (natures[i % len(natures)] if natures
+                                   else "Medical Dispute"),
                 "catchwords": "WORKERS COMPENSATION - permanent impairment",
                 "liability_posture": llm,
                 "liability_posture_rule": rule,
@@ -41,7 +51,8 @@ def _extract(denied_quantum=494, quantum_denied=129, procedural=77, agreeing=167
                 "consequential_condition_claimed": consequential if i % 2 else "No",
             })
 
-    add(denied_quantum, "liability_denied", "quantum_or_entitlement_only", "Yes")
+    add(denied_quantum, "liability_denied", "quantum_or_entitlement_only", "Yes",
+        natures=DOMINANT_NATURES)
     # 88 of the real 494 rest on the Nature field alone rather than concession
     # language: a weak-rule failure, not an under-specified category.
     for row in rows[:88]:
@@ -75,7 +86,29 @@ def test_the_dominant_cell_is_crossed_on_both_competing_explanations():
     bases = {"concession" if b in wc.CONCESSION_BASES else "nature_field_only"
              for b in dominant["liability_posture_basis"]}
     assert bases == {"concession", "nature_field_only"}
-    assert set(dominant["consequential_condition_claimed"]) >= {"Yes", "No"}
+
+
+def test_the_diagnostic_dispute_type_survives_the_draw():
+    """Liability disputes are where the outcome lift says partial denial is the
+    real cause (x2.26 against x1.15 in impairment). Unstratified, chance gave
+    them 3 of 25 and loaded the sample with the types whose answer is likely
+    'rule failure' -- which would then be read back as a finding."""
+    sample = wc.build_liability_adjudication_sample(_extract(), size=50)
+    dominant = sample[sample["_cell"] == "llm_denied__rule_quantum"]
+    groups = Counter(wc.dispute_group(n) for n in dominant["nature_of_case"])
+    assert groups["liability"] >= 5, groups
+    assert groups["impairment"] >= 3, groups
+    assert groups["medical"] >= 3, groups
+
+
+def test_the_near_balanced_axis_is_left_to_chance_and_survives_anyway():
+    """consequential sits near 50/50 inside the cell, so a random draw carries
+    it; the scarce diagnostic variable is the one that needs the stratum. Three
+    axes do not fit in 25 slots and this is the trade."""
+    sample = wc.build_liability_adjudication_sample(_extract(), size=50)
+    dominant = sample[sample["_cell"] == "llm_denied__rule_quantum"]
+    consequential = Counter(dominant["consequential_condition_claimed"].astype(str))
+    assert consequential["Yes"] >= 5 and consequential["No"] >= 5, consequential
 
 
 def test_a_starved_cell_does_not_shrink_the_sample():
@@ -218,6 +251,11 @@ def test_the_dominant_cell_is_scored_by_arm_not_as_one_number(tmp_path):
     note = wc.score_reference_set(path).iloc[0]["note"]
     assert "arm concession:" in note
     assert "arm nature_field_only:" in note
+    # And the localisation test: pooling dispute types would let medical and
+    # impairment -- half the disagreements, and the ones whose answer is likely
+    # 'rule failure' -- speak for liability disputes.
+    assert "dispute liability:" in note
+    assert "dispute impairment:" in note
 
 
 def test_the_stale_disagreement_figure_is_corrected_in_source():
