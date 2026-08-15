@@ -27,6 +27,7 @@ overwriting the workbook.
 import argparse
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -2574,11 +2575,15 @@ WORKED_EXAMPLES = [
                          "disagreement set and the partial-success population are effectively the "
                          "same object.",
         why_it_matters="Counting 'mixed' as a win rather than a loss moves the headline base rate "
-                       "by 10.7 points, and it does not move it evenly: Permanent Impairment is "
-                       "30.1% of the disagreement set against 15.8% of the corpus. If that base "
-                       "rate feeds a remuneration or conduct metric, money attaches to the "
-                       "definition, and a scheme participant will contest the definition of "
-                       "'loss' long before it contests any model built on top of it.",
+                       "by 10.7 points, and - see the definitional_metric_shift sheet - it does "
+                       "not move it evenly: 23.3 points on Permanent Impairment against 4.7 on "
+                       "Death Benefit. So the definition does not merely shift a number, it "
+                       "REDISTRIBUTES penalty between providers according to their book. A "
+                       "participant heavy in impairment matters is both disadvantaged by the base "
+                       "rate and most exposed to the definitional choice; the two compound. "
+                       "Whoever sets the definition is making a distributive decision wearing "
+                       "technical clothes, and a scheme participant will contest it long before "
+                       "it contests any model built on top of it.",
         how_it_was_caught="Two classifiers with different granularity were run over the same "
                           "cases and their disagreement reported rather than averaged away.",
         the_fix="There is no fix - there is a decision. Define 'loss' explicitly, state it with "
@@ -2681,15 +2686,21 @@ REFERENCE_SET_FIELDS = [
 ]
 
 
-# Per-field overrides on --reference-size. liability_posture carries a bigger
-# sheet than the others because it is answering two questions rather than one:
-# whether partial denial is real, and whether it is localised to the dispute
-# types where the outcome lift says it should be. At 50 the diagnostic stratum
-# (Liability Dispute, 25% of the dominant cell) lands 6 cases, which supports a
-# direction and not a conclusion -- and a weak result would be unreadable,
-# because nothing would separate 'the mechanism is not there' from 'the sample
-# was too small to see it'. 80 puts it near 10 without touching the other
-# sheets, which are estimating one accuracy each and do not need the room.
+# Per-field overrides on --reference-size.
+#
+# liability_posture carries 80 rather than 50, but NOT to power a localisation
+# test. Whether partial denial operates differently by dispute type is already
+# answered at corpus scale -- the outcome-lift table is n=711 -- and that
+# evidence does not need labels. What the labels answer is the prior question:
+# is liability_denied_in_part a real category that a human can apply
+# consistently? 40 dominant-cell cases answer that well, and they are the
+# precondition for everything else. Once in_part is in the schema and extracted
+# across all 2,385, localisation re-runs at full scale for free, against the
+# actual label instead of the disagreement proxy the lift table uses now.
+#
+# So 80 buys consistency-checking room and coverage of every dispute type,
+# not statistical power. It should not grow further: a bigger sheet would be
+# buying power for a question this sample is not the right instrument for.
 REFERENCE_SET_SIZES = {"liability_posture": 80}
 
 # Allocation for the liability_posture adjudication draw. Deliberately NOT
@@ -2783,10 +2794,16 @@ def build_liability_adjudication_sample(extract, size=50, seed=20260815):
     the fact. Liability Dispute is 25% of the cell and is the diagnostic
     stratum, and an unstratified draw gave it THREE cases out of 25 -- enough to
     load the sample with the dispute types whose answer is likely 'rule failure'
-    and then read that back as a finding about the mechanism. Stratify the rare
-    diagnostic variable; let the near-balanced one fall out.
+    and then read that back as a finding about the mechanism.
 
-    Three axes will not fit in 25 slots. This is the trade, made explicitly.
+    The general rule, worth keeping: stratify the scarce diagnostic variable and
+    let the near-balanced one fall out. A variable near 50/50 self-balances in
+    any reasonable draw; a 25% variable that the conclusion turns on does not.
+
+    What the dispute-type stratum buys here is COVERAGE, not power. Whether
+    partial denial varies by dispute type is already evidenced at n=711; these
+    labels answer whether the category is real and consistently applicable, and
+    for that every dispute type needs to be present rather than numerous.
     """
     if extract is None or not len(extract):
         return pd.DataFrame()
@@ -2906,6 +2923,31 @@ def build_reference_worksheets(extract, size=50, seed=20260815, prefill=False):
     return worksheets
 
 
+def wilson_interval(successes, total, z=1.96):
+    """95% Wilson score interval, as whole percentages.
+
+    Reported instead of a bare rate because every group in this report is small
+    enough that a point estimate is misleading on its own: 7 of 9 is 78%, and
+    also anything from 45% to 94%. Wilson rather than normal-approximation
+    because it stays inside [0, 1] and behaves at the extremes, which is exactly
+    where these counts live.
+    """
+    if not total:
+        return (0, 0)
+    proportion = successes / total
+    denominator = 1 + z * z / total
+    centre = (proportion + z * z / (2 * total)) / denominator
+    spread = (z * math.sqrt(proportion * (1 - proportion) / total
+                            + z * z / (4 * total * total)) / denominator)
+    return (round(100 * max(0.0, centre - spread)), round(100 * min(1.0, centre + spread)))
+
+
+def _rate(successes, total):
+    """'7/9 = 78% [45-94]' -- count, rate and interval travelling together."""
+    low, high = wilson_interval(successes, total)
+    return f"{successes}/{total} = {round(100 * successes / total)}% [{low}-{high}]"
+
+
 def score_reference_set(path):
     """Read back completed worksheets and report LLM accuracy per field.
 
@@ -2972,6 +3014,7 @@ def score_reference_set(path):
                     cell_rule = rows[rule_column].astype(str).str.strip()
                     arms = ["concession" if str(b) in CONCESSION_BASES else "nature_field_only"
                             for b in rows["liability_posture_basis"]]
+                    arm_rates = {}
                     for arm in ("concession", "nature_field_only"):
                         pick = [a == arm for a in arms]
                         if not any(pick):
@@ -2981,14 +3024,30 @@ def score_reference_set(path):
                         sided_llm = (arm_human == cell_model[pick]).sum()
                         arm_partial = arm_human.str.contains("in_part", case=False,
                                                              na=False).sum()
-                        parts.append(f"    arm {arm}: n={len(arm_human)}, sides with rule "
-                                     f"{sided_rule}, with LLM {sided_llm}, partial {arm_partial}")
+                        arm_rates[arm] = sided_rule / len(arm_human)
+                        parts.append(f"    arm {arm}: sides with rule "
+                                     f"{_rate(sided_rule, len(arm_human))}, with LLM "
+                                     f"{sided_llm}, partial {arm_partial}")
+                    # The caveat has to travel WITH the number. A workbook
+                    # outlives the conversation that hedged it, and whoever
+                    # opens this in six months will quote the comparison
+                    # without knowing what it can and cannot carry.
+                    if len(arm_rates) == 2:
+                        gap = round(100 * (arm_rates["nature_field_only"]
+                                           - arm_rates["concession"]))
+                        parts.append(
+                            f"    arm difference: {gap:+d} points (nature_field_only minus "
+                            f"concession). CAVEAT: the arms are ~31 v ~9 by construction, so "
+                            f"only a LARGE divergence is readable here. A small or zero "
+                            f"difference is uninformative - it is NOT evidence the two arms "
+                            f"are one story. Read direction and size, not significance.")
                     # The localisation test. Pooling these would let the dispute
                     # types whose answer is 'rule failure' -- medical and
                     # impairment, half of the disagreements -- speak for the
                     # ones where partial denial looks like the real cause.
                     if "nature_of_case" in rows.columns:
                         groups = [dispute_group(n) for n in rows["nature_of_case"]]
+                        group_rates = {}
                         for group in ("liability", "impairment", "medical", "other"):
                             pick = [g == group for g in groups]
                             if not any(pick):
@@ -2996,10 +3055,21 @@ def score_reference_set(path):
                             group_human = cell_human[pick]
                             group_partial = group_human.str.contains("in_part", case=False,
                                                                      na=False).sum()
+                            group_rates[group] = group_partial / len(group_human)
                             parts.append(
-                                f"    dispute {group}: n={len(group_human)}, partial "
-                                f"{group_partial} ({round(100 * group_partial / len(group_human))}%)"
-                                f", sides with rule {(group_human == cell_rule[pick]).sum()}")
+                                f"    dispute {group}: partial "
+                                f"{_rate(group_partial, len(group_human))}, sides with rule "
+                                f"{(group_human == cell_rule[pick]).sum()}")
+                        if len(group_rates) >= 2:
+                            top = max(group_rates, key=group_rates.get)
+                            bottom = min(group_rates, key=group_rates.get)
+                            spread = round(100 * (group_rates[top] - group_rates[bottom]))
+                            parts.append(
+                                f"    dispute spread: {spread} points, {top} highest, {bottom} "
+                                f"lowest. This sheet is not the instrument for localisation - "
+                                f"that runs at corpus scale (n=711 today, all 2,385 once in_part "
+                                f"is extracted). Read this as whether the category APPLIES "
+                                f"everywhere, not as the size of the dispute-type effect.")
             note = " | ".join(parts) + f" || confusions: {note}"
 
         report.append({

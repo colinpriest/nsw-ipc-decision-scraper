@@ -15,6 +15,7 @@ column revealing either extractor's answer may sit ahead of the human's column.
     python test_wc_reference_sets.py      # or: pytest
 """
 
+import re
 from collections import Counter
 
 import pandas as pd
@@ -246,19 +247,32 @@ def test_the_metric_shift_is_reported_not_left_as_an_assertion():
     assert "Permanent Impairment" in set(shift["scope"])
 
 
-def test_the_dominant_cell_is_scored_by_arm_not_as_one_number(tmp_path):
-    """If the human sides with the rule at a different rate where the rule had
-    only the Nature field, that is two mechanisms, not one story."""
+def _score_a_labelled_sheet(tmp_path):
+    """Label the adjudication sheet as the partial-denial hypothesis predicts,
+    score it, and return the note. Labels vary by arm so the arm comparison has
+    something to report."""
     sheets = wc.build_reference_worksheets(_extract(), size=50)
     sheet = sheets["liability_posture"].copy()
-    sheet["HUMAN_liability_posture"] = [
-        "liability_denied_in_part" if cell == "llm_denied__rule_quantum"
-        else "liability_denied" for cell in sheet["_cell"]]
+    labels = []
+    for cell, basis in zip(sheet["_cell"], sheet["liability_posture_basis"]):
+        if cell != "llm_denied__rule_quantum":
+            labels.append("liability_denied")
+        elif str(basis) in wc.CONCESSION_BASES:
+            labels.append("liability_denied_in_part")
+        else:
+            # The weak-rule arm: the human sides with the LLM instead.
+            labels.append("liability_denied")
+    sheet["HUMAN_liability_posture"] = labels
     path = tmp_path / "sets.xlsx"
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         sheet.to_excel(writer, sheet_name="liability_posture", index=False)
+    return wc.score_reference_set(path).iloc[0]["note"]
 
-    note = wc.score_reference_set(path).iloc[0]["note"]
+
+def test_the_dominant_cell_is_scored_by_arm_not_as_one_number(tmp_path):
+    """If the human sides with the rule at a different rate where the rule had
+    only the Nature field, that is two mechanisms, not one story."""
+    note = _score_a_labelled_sheet(tmp_path)
     assert "arm concession:" in note
     assert "arm nature_field_only:" in note
     # And the localisation test: pooling dispute types would let medical and
@@ -266,6 +280,46 @@ def test_the_dominant_cell_is_scored_by_arm_not_as_one_number(tmp_path):
     # 'rule failure' -- speak for liability disputes.
     assert "dispute liability:" in note
     assert "dispute impairment:" in note
+
+
+def test_every_small_group_rate_carries_an_interval(tmp_path):
+    """A point estimate on n=9 is misleading on its own, and 'significance' is
+    the wrong frame at these counts -- direction and size are what the labels
+    can support."""
+    note = _score_a_labelled_sheet(tmp_path)
+    # count/total = rate [low-high] on the group and arm lines.
+    assert re.search(r"dispute liability: partial \d+/\d+ = \d+% \[\d+-\d+\]", note), note
+    assert re.search(r"arm concession: sides with rule \d+/\d+ = \d+% \[\d+-\d+\]", note), note
+    assert "arm difference:" in note and "points" in note
+    assert "dispute spread:" in note
+
+
+def test_the_arm_caveat_travels_with_the_arm_number(tmp_path):
+    """The workbook outlives the conversation that hedged it. Whoever opens it
+    next quotes the comparison without the exchange that qualified it."""
+    note = _score_a_labelled_sheet(tmp_path)
+    assert "NOT evidence the two arms are one story" in note
+    assert "not significance" in note
+
+
+def test_the_localisation_caveat_names_the_right_instrument(tmp_path):
+    """These labels answer whether the category is real. Localisation runs at
+    corpus scale, and reading it off 40 cases is the conflation to prevent."""
+    note = _score_a_labelled_sheet(tmp_path)
+    assert "not the instrument for localisation" in note
+    assert "2,385" in note
+
+
+def test_wilson_interval_behaves_at_the_extremes():
+    """Normal approximation would run outside [0, 100] at exactly the counts
+    this report lives at."""
+    assert wc.wilson_interval(0, 0) == (0, 0)
+    low, high = wc.wilson_interval(9, 9)
+    assert 0 <= low <= 100 and high == 100
+    low, high = wc.wilson_interval(0, 9)
+    assert low == 0 and 0 <= high <= 100
+    low, high = wc.wilson_interval(7, 9)
+    assert low < 78 < high
 
 
 def test_the_stale_disagreement_figure_is_corrected_in_source():
