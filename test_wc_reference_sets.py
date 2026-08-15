@@ -375,6 +375,55 @@ def test_the_label_guard_fails_open_on_an_unreadable_file(tmp_path):
     assert wc.count_human_labels(tmp_path / "absent.xlsx") == 0
 
 
+def _graded(counts):
+    rows = []
+    for degree, n in counts.items():
+        rows += [{"relief_granted_degree": degree, "nature_of_case": "Medical Dispute"}] * n
+    return pd.DataFrame(rows)
+
+
+def test_the_curve_sweeps_every_place_the_line_could_sit():
+    """The metric stays count-based; the ordinal only slides the line that
+    decides which count a case falls in."""
+    curve = wc.summarise_relief_curve(_graded(
+        {"fully_granted": 50, "substantially_granted": 20, "partly_granted": 20,
+         "minimally_granted": 10, "refused": 30}))
+    overall = curve[curve["scope"] == "ALL"].set_index("line_drawn_at")
+    assert len(overall) == 4
+    assert overall.loc["fully_granted_or_better", "insurer_loses_%"] == 38.5
+    assert overall.loc["minimally_granted_or_better", "insurer_loses_%"] == 76.9
+    # The spread is the number the allocative-lever argument rests on.
+    assert overall["definitional_spread_points"].iloc[0] == 38.4
+
+
+def test_not_determinable_is_left_off_the_scale():
+    """Forcing it onto one end would invent a definitional answer for cases
+    where the orders do not permit one."""
+    curve = wc.summarise_relief_curve(_graded(
+        {"fully_granted": 50, "refused": 50, "not_determinable": 100}))
+    assert curve[curve["scope"] == "ALL"]["n_on_scale"].iloc[0] == 100
+
+
+def test_thin_scopes_are_dropped_rather_than_reported_as_a_curve():
+    """A four-point curve on eight cases is noise wearing a table's clothes."""
+    frame = _graded({"fully_granted": 5, "refused": 3})
+    assert not len(wc.summarise_relief_curve(frame))
+
+
+def test_the_curve_is_absent_rather_than_empty_without_the_field():
+    assert not len(wc.summarise_relief_curve(pd.DataFrame([{"case_id": "x"}])))
+
+
+def test_the_partial_win_limitation_is_stated_where_a_consumer_reads_it():
+    """Keeping the metric count-based does not require discarding the finding
+    that the count overstates clean wins -- only that it not be an input."""
+    entry = next(row for row in wc.FIELD_DOCS if row[0] == "relief_granted_degree")
+    definition = entry[-1]
+    assert "17.7%" in definition
+    assert "not an input to the" in definition
+    assert "Report it; do not build it in." in definition
+
+
 def test_a_frame_without_the_rule_column_yields_no_sheet_rather_than_a_bad_one():
     frame = _extract().drop(columns=["liability_posture_rule"])
     assert wc.build_liability_adjudication_sample(frame, size=50).empty

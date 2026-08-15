@@ -2480,6 +2480,14 @@ FIELD_DOCS = [
     ("relief_granted_degree", "conduct", "text", "llm_second_pass",
      "fully_granted / substantially_granted / partly_granted / minimally_granted / refused / "
      "not_determinable",
+     "SCOPE: this field draws the definitional sensitivity CURVE. It is not an input to the "
+     "metric, which stays count-based (the insurer loses or does not). Using it only for the "
+     "curve is what makes an ~11% one-step labelling error tolerable: it smears the curve rather "
+     "than relocating cases between outcome categories, so no re-vote was bought. "
+     "STATED LIMITATION, which this field measures and the count-based metric cannot see: 305 of "
+     "the 1,725 decisions scored as a claimant win -- 17.7% -- were granted LESS than fully "
+     "(substantially 174, partly 118, minimally 13). The metric treats full recovery and minimal "
+     "recovery as the same win, and this is the size of that. Report it; do not build it in. "
      "How much of what the worker PRESSED was granted, counting partial success within a head. "
      "Replaces the heads_succeeded/heads_claimed ratio, which measured the wrong granularity: "
      "64.4% of the corpus presses a single head, so the ratio could only be 0 or 1 and scored 60% "
@@ -3733,6 +3741,9 @@ def write_reference_sets(path, extract, size=50, seed=20260815, prefill=False):
             frozen.to_excel(writer, sheet_name="definitional_outcome_set", index=False)
         if len(shift):
             shift.to_excel(writer, sheet_name="definitional_metric_shift", index=False)
+        curve = summarise_relief_curve(extract)
+        if len(curve):
+            curve.to_excel(writer, sheet_name="definitional_curve", index=False)
         pd.DataFrame([
             {"instruction": "Label HUMAN_<field> WITHOUT reading MODEL_<field> (rightmost "
                             "column) - it is placed last so you can hide it. Anchoring on the "
@@ -4188,6 +4199,65 @@ def run_relief_pilot(args, records, file_index, extractor, llm_cache, cache_lock
     print("  - moves between runs     -> the curve would be made of noise")
     print(f"\nLLM spend: ${COST.total_cost():.4f} over {COST.calls} calls")
     return report
+
+
+# Most to least granted. not_determinable is not on the scale and is reported
+# separately rather than being forced onto one end of it.
+RELIEF_ORDER = ["fully_granted", "substantially_granted", "partly_granted",
+                "minimally_granted", "refused"]
+
+
+def summarise_relief_curve(extract):
+    """The definitional sensitivity curve, as a small table.
+
+    The METRIC stays count-based -- insurer loses or does not -- and the ordinal
+    is used only to slide the line that decides which is which. So each row is
+    one place the line could sit, and the columns are what the metric reads
+    there. Nothing here feeds the metric; it shows what the metric would say
+    under a different definition, which is the whole point of a sensitivity
+    analysis.
+
+    Reported by dispute type as well as overall, because the established
+    finding is that the definition redistributes: the swing is 23.3 points on
+    Permanent Impairment against 4.7 on Death Benefit, so a curve that only
+    reported the total would hide the thing worth seeing.
+    """
+    if extract is None or "relief_granted_degree" not in extract.columns:
+        return pd.DataFrame()
+    degree = extract["relief_granted_degree"].astype(str)
+    on_scale = degree.isin(RELIEF_ORDER)
+    rows = []
+
+    def sweep(frame, mask, scope):
+        counted = int(mask.sum())
+        if counted < 25:
+            return
+        values = degree[mask]
+        for cut in range(len(RELIEF_ORDER) - 1):
+            counts_as_loss = values.isin(RELIEF_ORDER[:cut + 1])
+            rows.append({
+                "scope": scope,
+                "line_drawn_at": f"{RELIEF_ORDER[cut]}_or_better",
+                "insurer_loses_n": int(counts_as_loss.sum()),
+                "insurer_loses_%": round(100 * counts_as_loss.mean(), 1),
+                "n_on_scale": counted,
+            })
+
+    sweep(extract, on_scale, "ALL")
+    if "nature_of_case" in extract.columns:
+        nature = extract["nature_of_case"].astype(str)
+        for name in sorted(nature.unique()):
+            sweep(extract, on_scale & nature.eq(name), name)
+
+    curve = pd.DataFrame(rows)
+    if len(curve):
+        # The spread between the strictest and most generous line, which is the
+        # number the allocative-lever argument actually rests on.
+        spread = (curve.groupby("scope")["insurer_loses_%"]
+                  .agg(lambda values: round(values.max() - values.min(), 1))
+                  .rename("definitional_spread_points"))
+        curve = curve.merge(spread, on="scope", how="left")
+    return curve
 
 
 def audit_invariants(extract):
