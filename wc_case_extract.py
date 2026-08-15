@@ -29,6 +29,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import threading
 import time
@@ -2476,6 +2477,32 @@ FIELD_DOCS = [
      "values rather than separate booleans."),
     ("conduct_evidence", "conduct", "text", "llm_second_pass", "",
      "Verbatim quote of the Member's remark on conduct."),
+    ("relief_granted_degree", "conduct", "text", "llm_second_pass",
+     "fully_granted / substantially_granted / partly_granted / minimally_granted / refused / "
+     "not_determinable",
+     "How much of what the worker PRESSED was granted, counting partial success within a head. "
+     "Replaces the heads_succeeded/heads_claimed ratio, which measured the wrong granularity: "
+     "64.4% of the corpus presses a single head, so the ratio could only be 0 or 1 and scored 60% "
+     "of 'mixed' decisions at a perfect 1.0. This is the field that makes the definitional "
+     "question a sensitivity curve rather than a two-point comparison."),
+    ("relief_granted_evidence", "conduct", "text", "llm_second_pass", "",
+     "Verbatim quote from the orders supporting the degree."),
+    ("relief_status", "conduct", "text", "audit", "ok / not run / error text",
+     "Whether the relief pass ran."),
+    ("relief_agreement", "conduct", "text", "audit",
+     "single_vote / unanimous / majority / no_majority / not_run",
+     "How the delivered degree was arrived at. Re-voting is TARGETED at the middle three "
+     "categories, where the sensitivity threshold slides, so an extreme carrying 'single_vote' is "
+     "not less trustworthy than a re-voted middle case -- it was never in doubt."),
+    ("relief_votes", "conduct", "text", "audit", "comma-separated",
+     "Every vote cast, keyed internally by seed so the production vote and the pilot's first vote "
+     "(which share a seed) cannot be counted twice."),
+    ("relief_stability", "conduct", "text", "audit", "",
+     "Records that this field is SINGLE-VOTE. Piloted at 89% unanimous over 3 votes on 100 cases, "
+     "against 91% on the gated fields. Gating was declined deliberately: the field feeds a "
+     "sensitivity curve, where a label moving one adjacent step blurs the line, rather than a "
+     "cohort assignment, where it would relocate a case between analysis populations. Treat "
+     "roughly 11% of values as soft."),
     ("conduct_status", "conduct", "text", "audit",
      "ok / not run / heads_inconsistent / error text",
      "Whether the second pass ran. Distinguishes 'not run' from 'ran and found nothing', for the "
@@ -3963,6 +3990,75 @@ def cached_relief_votes(extractor, cache, url, text, context=None, lock=None,
     return votes
 
 
+def run_relief_revote(args, records, file_index, extractor, llm_cache, cache_lock):
+    """Two extra votes on the middle categories, plus a bounding sample of extremes.
+
+    Gating the whole corpus costs 3x to sharpen 79% of cases that are not in
+    doubt. Re-voting only where the threshold slides costs about a third of
+    that and resolves the noise that actually reaches the curve. The price is a
+    blind spot -- an extreme misread as an extreme is never revisited -- which
+    the bounding sample measures rather than assumes.
+    """
+    middle, extreme = relief_revote_targets(llm_cache, extremes=args.relief_revote_extremes,
+                                            seed=args.seed)
+    targets = set(middle) | set(extreme)
+    print(f"\nRelief re-vote: {len(middle)} middle-category cases"
+          f" + {len(extreme)} sampled extremes, 2 extra votes each")
+    if not targets:
+        print("Nothing to re-vote: run --relief-pass first.")
+        return {}
+
+    by_url = {}
+    for csv_row in records:
+        url = csv_row.get("URL")
+        if url in targets:
+            by_url[url] = csv_row
+
+    before = {url: (llm_cache.get(url, {}).get("_relief") or {}).get("relief_granted_degree")
+              for url in targets}
+
+    def revote(url):
+        csv_row = by_url.get(url)
+        if csv_row is None:
+            return
+        _case_id, year, number = case_id_from_url(url)
+        entry = file_index.get((year, number), {"canonical": None, "all": []})
+        text = load_text(url, entry["canonical"], args.decisions, args.cache)
+        if not text:
+            return
+        cached_relief_votes(extractor, llm_cache, url, text, context=url,
+                            lock=cache_lock, seeds=RELIEF_PILOT_SEEDS[1:])
+
+    workers = max(1, min(args.workers, len(targets)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(revote, sorted(targets)))
+    save_llm_cache(args.llm_cache, llm_cache)
+
+    def summarise(urls, label):
+        if not urls:
+            return
+        agreements, changed, to_middle = Counter(), 0, 0
+        for url in urls:
+            value, agreement, _votes = resolve_relief_votes(llm_cache.get(url))
+            agreements[agreement] += 1
+            if value and value != before.get(url):
+                changed += 1
+                if value in MIDDLE_DEGREES:
+                    to_middle += 1
+        print(f"\n{label} (n={len(urls)}):")
+        for name, count in agreements.most_common():
+            print(f"  {name:<14} {count:>4}  {100 * count / len(urls):5.1f}%")
+        print(f"  value changed  {changed:>4}  {100 * changed / len(urls):5.1f}%")
+        if label.startswith("Extremes"):
+            print(f"  moved INTO a middle category {to_middle} "
+                  f"({100 * to_middle / len(urls):.1f}%) <- the blind-spot bound")
+
+    summarise(middle, "Middle categories")
+    summarise(extreme, "Extremes (bounding sample)")
+    print(f"\nLLM spend: ${COST.total_cost():.4f} over {COST.calls} calls")
+    return {"middle": len(middle), "extremes": len(extreme)}
+
+
 def run_relief_pilot(args, records, file_index, extractor, llm_cache, cache_lock):
     """Pilot the relief ordinal and report. Writes nothing but the cache.
 
@@ -4046,6 +4142,142 @@ def summarise_relief_pilot(all_votes):
         "majority_only_%": round(100 * majority / len(complete), 1) if complete else 0.0,
         "no_majority_%": round(100 * scattered / len(complete), 1) if complete else 0.0,
     }
+
+
+def cached_relief_extract(extractor, cache, url, text, context=None, lock=None):
+    """Single-vote production pass for the relief ordinal.
+
+    Stores the full record under `_relief`, separate from the pilot's
+    `_relief_votes`. The 100 pilot cases are therefore re-extracted rather than
+    reusing vote one: the votes hold only the ordinal, and taking them would
+    leave those rows with a degree and no evidence quote -- a silent hole in
+    exactly the column that makes the value auditable, to save about a dollar.
+    The votes stay in the cache as the stability record.
+    """
+    def _read():
+        return cache.get(url) or {}
+
+    entry = _read() if lock is None else _with(lock, _read)
+    if entry.get("_relief_version") == WC_RELIEF_VERSION and entry.get("_relief"):
+        try:
+            return WCReliefSchema(**entry["_relief"]), None, True
+        except Exception:
+            pass  # Malformed: fall through and re-extract.
+    if extractor is None:
+        return None, "llm disabled", False
+    parsed, _usage, error = extract_wc_relief_llm(
+        extractor, text, context=context, seed=RELIEF_PILOT_SEEDS[0])
+    if parsed is not None:
+        def _write():
+            slot = cache.setdefault(url, {})
+            slot["_relief"] = parsed.model_dump(mode="json")
+            slot["_relief_version"] = WC_RELIEF_VERSION
+        _write() if lock is None else _with(lock, _write)
+    return parsed, error, False
+
+
+# The three values the sensitivity threshold actually slides across. Re-voting
+# is targeted here rather than run corpus-wide: gating everything costs 3x to
+# sharpen the 79% of cases sitting at fully_granted or refused, where the pilot
+# found 56/58 and 18/19 agreement with the outcome field and nothing is in
+# doubt.
+MIDDLE_DEGREES = {"substantially_granted", "partly_granted", "minimally_granted"}
+
+
+def resolve_relief_votes(entry):
+    """Combine the delivered vote with any re-votes. Returns (value, agreement, votes).
+
+    Votes are keyed by SEED, not appended to a list: the production pass and the
+    pilot's first vote both use RELIEF_PILOT_SEEDS[0], so a naive concatenation
+    would count one answer twice on the 100 pilot cases and manufacture
+    unanimity out of a single opinion.
+    """
+    entry = entry or {}
+    base = (entry.get("_relief") or {}).get("relief_granted_degree")
+    by_seed = {str(seed): value for seed, value in (entry.get("_relief_votes") or {}).items()
+               if value}
+    if base:
+        by_seed[str(RELIEF_PILOT_SEEDS[0])] = base
+    votes = [by_seed[key] for key in sorted(by_seed)]
+    if not votes:
+        return None, "not_run", []
+    if len(votes) == 1:
+        return votes[0], "single_vote", votes
+    tally = Counter(votes)
+    winner, count = tally.most_common(1)[0]
+    if len(set(votes)) == 1:
+        return winner, "unanimous", votes
+    if count >= 2:
+        return winner, "majority", votes
+    # Every vote different: keep the delivered value and flag it rather than
+    # pretending a tie was broken.
+    return base or votes[0], "no_majority", votes
+
+
+def relief_revote_targets(cache, extremes=0, seed=20260815):
+    """URLs needing extra votes: every middle-category case, plus a random
+    sample of extremes to BOUND the blind spot.
+
+    The targeted design cannot see an extreme→middle error, because it never
+    re-votes an extreme. Sampling some anyway turns that from an unknown into a
+    measured rate, which is the difference between a limitation and a hole.
+    """
+    middle, extreme = [], []
+    for url, entry in cache.items():
+        degree = (entry.get("_relief") or {}).get("relief_granted_degree")
+        if not degree:
+            continue
+        (middle if degree in MIDDLE_DEGREES else extreme).append(url)
+    if extremes and extreme:
+        rng = random.Random(seed)
+        extreme = rng.sample(extreme, min(extremes, len(extreme)))
+    else:
+        extreme = []
+    return sorted(middle), sorted(extreme)
+
+
+RELIEF_OVERLAY = [
+    ("relief_granted_degree", "relief_granted_degree"),
+    ("relief_granted_evidence", "relief_granted_evidence"),
+]
+
+
+def apply_relief(row, parsed, error=None, resolution=None):
+    """Write the relief ordinal onto a row.
+
+    Single-vote by choice: the pilot measured 89% unanimity, and this field
+    feeds a sensitivity CURVE rather than a cohort assignment. A label that
+    moves one adjacent step blurs the line; it does not relocate a case between
+    analysis populations the way primary_injury would. Paying 3x to sharpen a
+    sensitivity analysis is the trade the stability-gate example says to make
+    explicitly, and here it was declined. relief_stability records that.
+    """
+    row["relief_status"] = "ok" if parsed is not None else (error or "not run")
+    if parsed is None:
+        for _attribute, column in RELIEF_OVERLAY:
+            row.setdefault(column, None)
+        row["relief_agreement"] = "not_run"
+        row["relief_votes"] = ""
+        row["relief_stability"] = "not_run"
+        return row
+    for attribute, column in RELIEF_OVERLAY:
+        value = getattr(parsed, attribute, None)
+        if isinstance(value, Enum):
+            value = value.value
+        elif isinstance(value, str):
+            value = value[:600]
+        row[column] = value
+
+    value, agreement, votes = (resolution or (None, "single_vote", []))
+    if value:
+        # The resolved value REPLACES the single vote where re-voting happened.
+        row["relief_granted_degree"] = value
+    row["relief_agreement"] = agreement
+    row["relief_votes"] = ",".join(votes)
+    row["relief_stability"] = (
+        "single_vote_89pc_unanimous_in_pilot" if agreement == "single_vote"
+        else f"revoted_{agreement}")
+    return row
 
 
 def cached_conduct_extract(extractor, cache, url, text, context=None, lock=None):
@@ -4230,6 +4462,16 @@ def main():
                              "3x on the ~9%% that disagree.")
     parser.add_argument("--refresh-llm", action="store_true",
                         help="Ignore cached LLM results and re-extract")
+    parser.add_argument("--relief-pass", action="store_true",
+                        help="Run the relief_granted_degree pass, single vote per case. "
+                             "Versioned apart from the conduct pass. ~$28 over the full corpus.")
+    parser.add_argument("--relief-revote", action="store_true",
+                        help="Two extra votes on cases sitting in the middle three degrees, "
+                             "where the sensitivity threshold slides, then majority-resolve. "
+                             "Targets ~19%% of the corpus instead of gating all of it.")
+    parser.add_argument("--relief-revote-extremes", type=int, default=100, metavar="N",
+                        help="Also re-vote N random cases at the extremes, to BOUND the "
+                             "extreme-to-middle errors the targeted design cannot see. 0 to skip.")
     parser.add_argument("--relief-pilot", type=int, metavar="N",
                         help="Pilot the relief_granted_degree ordinal on N cases with 3 votes "
                              "each, report the distribution and run-to-run stability, and exit. "
@@ -4325,6 +4567,10 @@ def main():
         run_relief_pilot(args, records, file_index, extractor, llm_cache, cache_lock)
         return
 
+    if args.relief_revote:
+        run_relief_revote(args, records, file_index, extractor, llm_cache, cache_lock)
+        return
+
     def process(csv_row):
         """One case end to end. Runs in a worker thread: the HTML parse is
         CPU-bound and the LLM call is I/O-bound, so both benefit from the pool.
@@ -4366,6 +4612,16 @@ def main():
             if conduct is None and extractor is not None:
                 counters["conduct_errors"] += 1
         apply_conduct(row, conduct, conduct_error)
+
+        relief, relief_error = None, "not run"
+        if args.relief_pass and text and (extractor is not None or url in llm_cache):
+            relief, relief_error, relief_cached = cached_relief_extract(
+                extractor, llm_cache, url, text, context=case_id, lock=cache_lock)
+            counters["relief_cache_hits"] += int(relief_cached)
+            if relief is None and extractor is not None:
+                counters["relief_errors"] += 1
+        apply_relief(row, relief, relief_error,
+                     resolution=resolve_relief_votes(llm_cache.get(url)))
         derive_review_flags(row)
         normalise_row(row)
         return row

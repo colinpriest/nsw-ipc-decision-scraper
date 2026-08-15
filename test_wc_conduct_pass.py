@@ -289,11 +289,105 @@ def test_the_endogeneity_caveat_is_recorded_where_a_consumer_will_hit_it():
     assert "same document by the same person" in definition
 
 
+def test_the_relief_pass_does_not_reuse_pilot_votes_for_the_delivered_value():
+    """The votes hold the ordinal but no evidence quote. Reusing them would
+    leave those rows with a degree and no way to audit it."""
+    cache = {"u1": {"_relief_votes": {str(wc.RELIEF_PILOT_SEEDS[0]): "partly_granted"},
+                    "_relief_version": wc.WC_RELIEF_VERSION}}
+    parsed, error, was_cached = wc.cached_relief_extract(None, cache, "u1", "text")
+    assert not was_cached and parsed is None and error == "llm disabled"
+
+
+def test_a_stored_relief_record_is_served_from_cache():
+    cache = {"u1": {"_relief": wc.WCReliefSchema(
+        relief_granted_degree=wc.ReliefGrantedEnum.partly_granted,
+        relief_granted_evidence="allowed for eight months").model_dump(mode="json"),
+        "_relief_version": wc.WC_RELIEF_VERSION}}
+    parsed, _error, was_cached = wc.cached_relief_extract(None, cache, "u1", "text")
+    assert was_cached and parsed.relief_granted_degree.value == "partly_granted"
+
+
+def test_the_single_vote_choice_is_recorded_on_every_row():
+    """A field carrying ~11% soft values must say so where a consumer reads it,
+    not only in a commit message."""
+    row = wc.apply_relief({}, wc.WCReliefSchema(
+        relief_granted_degree=wc.ReliefGrantedEnum.substantially_granted,
+        relief_granted_evidence="the great majority of the period claimed"))
+    assert row["relief_granted_degree"] == "substantially_granted"
+    assert "single_vote" in row["relief_stability"]
+    assert row["relief_status"] == "ok"
+
+    not_run = wc.apply_relief({}, None)
+    assert not_run["relief_status"] == "not run"
+    assert not_run["relief_granted_degree"] is None
+
+
+def test_one_opinion_is_never_counted_as_two():
+    """The production pass and the pilot's first vote share a seed. Appending
+    them would manufacture unanimity out of a single opinion on the 100 pilot
+    cases."""
+    seed = str(wc.RELIEF_PILOT_SEEDS[0])
+    entry = {"_relief": {"relief_granted_degree": "partly_granted",
+                         "relief_granted_evidence": "q"},
+             "_relief_votes": {seed: "partly_granted"}}
+    value, agreement, votes = wc.resolve_relief_votes(entry)
+    assert votes == ["partly_granted"]
+    assert agreement == "single_vote" and value == "partly_granted"
+
+
+def test_revotes_resolve_by_majority_and_flag_a_three_way_split():
+    seeds = [str(s) for s in wc.RELIEF_PILOT_SEEDS]
+    base = {"_relief": {"relief_granted_degree": "partly_granted", "relief_granted_evidence": ""}}
+
+    unanimous = dict(base, _relief_votes={seeds[1]: "partly_granted",
+                                          seeds[2]: "partly_granted"})
+    assert wc.resolve_relief_votes(unanimous)[1] == "unanimous"
+
+    majority = dict(base, _relief_votes={seeds[1]: "substantially_granted",
+                                         seeds[2]: "partly_granted"})
+    value, agreement, _ = wc.resolve_relief_votes(majority)
+    assert agreement == "majority" and value == "partly_granted"
+
+    split = dict(base, _relief_votes={seeds[1]: "substantially_granted",
+                                      seeds[2]: "minimally_granted"})
+    value, agreement, _ = wc.resolve_relief_votes(split)
+    # Keeps the delivered value rather than pretending a tie was broken.
+    assert agreement == "no_majority" and value == "partly_granted"
+
+
+def test_revoting_targets_the_middle_and_samples_the_extremes():
+    cache = {}
+    for i in range(40):
+        degree = "partly_granted" if i < 10 else "fully_granted"
+        cache[f"u{i}"] = {"_relief": {"relief_granted_degree": degree,
+                                      "relief_granted_evidence": ""}}
+    middle, extreme = wc.relief_revote_targets(cache, extremes=5, seed=1)
+    assert len(middle) == 10
+    assert len(extreme) == 5
+    assert not set(middle) & set(extreme)
+    # The bound is opt-out, not mandatory.
+    assert wc.relief_revote_targets(cache, extremes=0)[1] == []
+
+
+def test_the_resolved_value_replaces_the_single_vote_on_the_row():
+    parsed = wc.WCReliefSchema(relief_granted_degree=wc.ReliefGrantedEnum.partly_granted,
+                               relief_granted_evidence="q")
+    row = wc.apply_relief({}, parsed, resolution=(
+        "substantially_granted", "majority",
+        ["partly_granted", "substantially_granted", "substantially_granted"]))
+    assert row["relief_granted_degree"] == "substantially_granted"
+    assert row["relief_agreement"] == "majority"
+    assert row["relief_votes"].count(",") == 2
+    assert row["relief_stability"] == "revoted_majority"
+
+
 def test_every_new_column_is_documented():
     """The dictionary asserts coverage; a new column with no entry comes back
     as UNDOCUMENTED rather than being silently omitted."""
     columns = [column for _attribute, column in wc.CONDUCT_OVERLAY]
-    columns += ["claimant_success_degree", "conduct_status"]
+    columns += [column for _attribute, column in wc.RELIEF_OVERLAY]
+    columns += ["relief_agreement", "relief_votes"]
+    columns += ["claimant_success_degree", "conduct_status", "relief_status", "relief_stability"]
     documented = wc.build_dictionary(columns=columns)
     undocumented = documented[documented["group"] == "UNDOCUMENTED"]["field"].tolist()
     assert not [c for c in columns if c in undocumented], undocumented
