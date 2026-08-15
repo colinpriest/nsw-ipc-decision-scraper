@@ -69,7 +69,10 @@ WC_REASONING_EFFORT = os.getenv("NSW_WC_REASONING_EFFORT", "low")
 # cache entries written under an older version are discarded on load.
 WC_SCHEMA_VERSION = 8
 LLM_CACHE_FILE = os.path.join(OUTPUT_ROOT, "wc_llm_cache.json")
-DICTIONARY_XLSX = os.path.join(OUTPUT_ROOT, "wc_data_dictionary.xlsx")
+DICTIONARY_XLSX = os.path.join("docs", "wc_data_dictionary.xlsx")
+# Worksheets carry case names and catchwords, so they are written under
+# output/ (git-ignored) rather than into the tracked dictionary.
+WORKSHEETS_XLSX = os.path.join(OUTPUT_ROOT, "wc_reference_sets.xlsx")
 
 
 # ----------------------------------------------------------------------
@@ -2332,6 +2335,13 @@ DICTIONARY_NOTES = [
     ("Ordinal direction", "work_impact_severity is higher = worse; ability_to_work is its "
                           "complement, higher = better. Use one, not both."),
     ("FALLBACK PRINCIPLE - when a rule earns its place", FALLBACK_PRINCIPLE),
+    ("The claimant_age pattern - the template for a distrusted rule",
+     "claimant_age is the model to copy when a rule is informative but not trustworthy enough to "
+     "deliver: the rule's value is RETAINED in claimant_age_rule as evidence and for audit, but "
+     "it is never allowed to populate the field itself, which is LLM-only at ~29/100 - close to "
+     "the honest ceiling of ~38%. Retain the rule as evidence; do not let it populate. This is "
+     "strictly better than either deleting the rule (losing the audit trail) or letting it fill "
+     "gaps (delivering wrong values as fact)."),
     ("Structurally absent vs extraction failure",
      "Some columns are almost entirely empty because the DECISIONS do not record the fact, not "
      "because extraction failed. Confirmed structurally absent: legal_costs_amount (only 6 of "
@@ -2472,7 +2482,11 @@ SELECTION_STAGES = [
         population="Rows usable for a given analysis",
         filter_applied="Per-field missingness",
         removed="Rows where the decision never stated the fact",
-        bias_direction="Field-specific and often NOT random. Age appears in ~38% of decisions "
+        bias_direction="Field-specific and often NOT random. COHORT ASSIGNMENT IS ITSELF A "
+                       "FILTER: primary_injury is 'multiple' or 'not_stated' on ~23% of cases, "
+                       "so any injury-cohort analysis silently runs on the ~77% that can be "
+                       "assigned - state that before computing cohort rates. "
+                       "Age appears in ~38% of decisions "
                        "and is stated more often where it matters to the reasoning. Insurer is "
                        "nameable in ~50% because the employer, not the insurer, is respondent. "
                        "Complete-case analysis on these fields is a further, silent selection.",
@@ -2717,6 +2731,37 @@ def build_validation_worksheet(extract, size=40, seed=20260815):
     return worksheet
 
 
+def write_reference_sets(path, extract, size=50, seed=20260815, prefill=False):
+    """Hand-labelling worksheets and the frozen definitional set.
+
+    Kept OUT of the tracked dictionary: these carry case names and catchwords,
+    and the repo's convention is that litigant-bearing artifacts stay under
+    output/.
+    """
+    if extract is None or not len(extract):
+        return {}
+    worksheets = build_reference_worksheets(extract, size=size, seed=seed, prefill=prefill)
+    frozen = freeze_definitional_set(extract)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        for field, sheet in worksheets.items():
+            sheet.to_excel(writer, sheet_name=field[:31], index=False)
+        if len(frozen):
+            frozen.to_excel(writer, sheet_name="definitional_outcome_set", index=False)
+        pd.DataFrame([
+            {"instruction": "Label HUMAN_<field> WITHOUT reading MODEL_<field> (rightmost "
+                            "column) - it is placed last so you can hide it. Anchoring on the "
+                            "model's answer inflates measured accuracy and defeats the purpose."},
+            {"instruction": "Use the catchwords first: they state what the Member decided. Open "
+                            "source_html_file only where the catchwords are inconclusive."},
+            {"instruction": "Leave HUMAN_<field> blank if genuinely undecidable; blanks are "
+                            "skipped in scoring rather than counted as errors."},
+            {"instruction": "Score with: python wc_case_extract.py --score-validation "
+                            "output/wc_reference_sets.xlsx"},
+        ]).to_excel(writer, sheet_name="how_to_label", index=False)
+    return worksheets
+
+
 def build_dictionary(columns=None):
     """Expand FIELD_DOCS with the generated cross-check columns.
 
@@ -2793,9 +2838,6 @@ def write_data_dictionary(path, columns=None, corpus=None, extract=None):
             writer, sheet_name="selection_funnel", index=False)
         pd.DataFrame(WORKED_EXAMPLES).to_excel(
             writer, sheet_name="worked_examples", index=False)
-        worksheet = build_validation_worksheet(extract)
-        if len(worksheet):
-            worksheet.to_excel(writer, sheet_name="validation_worksheet", index=False)
         pd.DataFrame(enumeration_rows(), columns=["field", "value"]).to_excel(
             writer, sheet_name="enumerations", index=False)
     return dictionary
@@ -3111,8 +3153,25 @@ def main():
                         help="Concurrent LLM calls (default 20)")
     parser.add_argument("--dictionary-out", default=DICTIONARY_XLSX,
                         help="Path for the standalone data dictionary workbook")
+    parser.add_argument("--reference-out", default=WORKSHEETS_XLSX,
+                        help="Path for hand-labelling worksheets and the frozen definitional set")
+    parser.add_argument("--reference-size", type=int, default=50,
+                        help="Cases per field in the hand-labelling reference set")
+    parser.add_argument("--score-validation", metavar="XLSX",
+                        help="Score completed worksheets and exit")
     parser.add_argument("--quiet", action="store_true", help="Skip the per-case review dump")
     args = parser.parse_args()
+
+    if args.score_validation:
+        report = score_reference_set(args.score_validation)
+        if not len(report):
+            print("No scorable sheets found.")
+            return
+        print("\nLLM accuracy against the human reference set:")
+        for _, row in report.iterrows():
+            accuracy = "n/a" if row["accuracy"] is None else f"{row['accuracy']}%"
+            print(f"  {row['field']:<22} {accuracy:>7}  (n={row['labelled']})  {row['note']}")
+        return
 
     frame = pd.read_csv(args.csv, low_memory=False)
     workers_comp = frame[frame["Case Type"].astype(str).str.strip() == "Workers Compensation"]
@@ -3247,6 +3306,11 @@ def main():
 
     dictionary = write_data_dictionary(args.dictionary_out, list(extract.columns),
                                        corpus=frame, extract=extract)
+    worksheets = write_reference_sets(args.reference_out, extract, size=args.reference_size)
+    frozen = freeze_definitional_set(extract)
+    print(f"Wrote {args.reference_out}: "
+          + ", ".join(f"{k} n={len(v)}" for k, v in worksheets.items())
+          + f", definitional_outcome_set n={len(frozen)}")
     undocumented = (dictionary["group"] == "UNDOCUMENTED").sum()
     print(f"Wrote {args.dictionary_out}: {len(dictionary)} field definitions"
           + (f" -- WARNING {undocumented} UNDOCUMENTED" if undocumented else ""))
