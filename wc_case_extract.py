@@ -1956,6 +1956,7 @@ def apply_conduct(row, parsed, error=None):
         for _attribute, column in CONDUCT_OVERLAY:
             row.setdefault(column, None)
         row["claimant_success_degree"] = None
+        row["liability_posture_3v"] = None
         return row
 
     for attribute, column in CONDUCT_OVERLAY:
@@ -1968,6 +1969,12 @@ def apply_conduct(row, parsed, error=None):
         elif isinstance(value, str):
             value = value[:600]
         row[column] = value
+
+    # Derived, not extracted: free, deterministic, and emitted alongside the
+    # original rather than replacing it, so every documented figure keyed to
+    # liability_posture stays true and the change is auditable.
+    row["liability_posture_3v"] = derive_three_value_posture(
+        row.get("denial_scope"), row.get("liability_posture"), row.get("nature_of_case"))
 
     claimed = row.get("heads_claimed") or 0
     succeeded = row.get("heads_succeeded") or 0
@@ -2477,6 +2484,21 @@ FIELD_DOCS = [
      "values rather than separate booleans."),
     ("conduct_evidence", "conduct", "text", "llm_second_pass", "",
      "Verbatim quote of the Member's remark on conduct."),
+    ("liability_posture_3v", "process", "text", "derived",
+     "liability_denied / liability_denied_in_part / quantum_or_entitlement_only / "
+     "not_applicable_procedural / not_stated",
+     "Three-value posture, DERIVED from denial_scope, not extracted: primary_injury denied -> "
+     "liability_denied; nothing_denied -> quantum_or_entitlement_only; anything else denied -> "
+     "liability_denied_in_part. Deterministic, so it cannot drift between runs and cost nothing. "
+     "STRUCTURAL not legal: strictly only a denied consequential condition denies liability, "
+     "while treatment, impairment head, weekly entitlement and work capacity are denials of "
+     "entitlements flowing from accepted liability. The structural reading is used because the "
+     "metric measures conduct, not pleading - a provider that accepts every injury and denies "
+     "every weekly payment is not cooperative. 1,000 matters (41.9%) are in_part, and 514 of the "
+     "748 the binary called quantum_or_entitlement_only (68.7%) move there. "
+     "The original liability_posture column is UNCHANGED beside it, so figures keyed to the "
+     "binary stay checkable. INHERITS denial_scope's accuracy completely: denial_scope is "
+     "single-source with no rule cross-check, and this derivation makes it load-bearing."),
     ("relief_granted_degree", "conduct", "text", "llm_second_pass",
      "fully_granted / substantially_granted / partly_granted / minimally_granted / refused / "
      "not_determinable",
@@ -3345,6 +3367,113 @@ def build_liability_adjudication_sample(extract, size=50, seed=20260815):
     return pd.concat(chunks).sample(frac=1, random_state=seed)
 
 
+def derive_three_value_posture(denial_scope, posture, nature=None):
+    """The three-value posture, DERIVED from denial_scope. No LLM pass.
+
+    The structural reading, not the legal one, and the difference is the whole
+    point. Strictly, only a denied consequential condition is a denial of
+    liability -- denying that an injury is work-related. A denied treatment,
+    impairment head, weekly entitlement or work capacity is a denial of an
+    entitlement flowing from liability already accepted.
+
+    But the metric is measuring conduct, not pleading. A provider that accepts
+    every injury and then denies every weekly payment is not cooperative, and
+    coding it 'quantum_or_entitlement_only' is precisely the blind spot the
+    third value exists to close. So anything denied that is not the primary
+    injury lands in_part.
+
+    Because it is a derivation, it costs nothing, cannot drift from run to run,
+    and needs no cache version -- but it inherits denial_scope's accuracy
+    completely. denial_scope is single-source with no rule cross-check, so it is
+    now load-bearing in a way it was not when it merely described a case.
+    """
+    scope = str(denial_scope if denial_scope is not None else "").strip()
+    if scope.lower() in ("nan", "none", "not_stated"):
+        scope = ""
+
+    if "primary_injury" in scope:
+        value = "liability_denied"
+    elif scope == "nothing_denied":
+        value = "quantum_or_entitlement_only"
+    elif not scope:
+        # Blank falls back to the existing binary rather than becoming its own
+        # value: 6 matters, so a separate 'not_stated' would buy a category
+        # nobody can act on. They keep the binary's blind spot, which is the
+        # honest description of what is known about them.
+        value = str(posture) if posture is not None else ""
+    else:
+        value = "liability_denied_in_part"
+
+    # Applied LAST and overriding: a procedural matter has no posture to
+    # describe, whatever a denial happened to be recorded against it.
+    if str(nature).strip() == "Procedural":
+        value = "not_applicable_procedural"
+    return value
+
+
+def build_denial_scope_worksheet(extract, size=60, seed=20260815):
+    """Hand-labelling sheet for denial_scope, which the derivation made load-bearing.
+
+    Making the third value a derivation removes the need to validate the
+    POSTURE -- a deterministic rule cannot be inconsistently applied -- and
+    moves the whole question one step upstream. Every error in the new field is
+    now an error in denial_scope, which is single-source, has no rule
+    cross-check, and has never been validated against a human.
+
+    So this sheet labels denial_scope. The 80-case adjudication set cannot serve
+    here for two reasons: it labels a different field, and it is drawn entirely
+    from rule-vs-LLM disagreement cells, while 66.2% of the cases the derivation
+    calls in_part are ones where the two methods AGREE on the binary. They agree
+    on a category that cannot express the state, so agreement is not evidence of
+    correctness.
+
+    Stratified on the derived posture crossed with whether the methods agree, so
+    the labeller sees every region the derivation depends on.
+    """
+    if extract is None or not len(extract):
+        return pd.DataFrame()
+    needed = {"denial_scope", "liability_posture", "liability_posture_rule"}
+    if not needed.issubset(extract.columns):
+        return pd.DataFrame()
+
+    frame = extract.copy()
+    frame["_derived3"] = [derive_three_value_posture(scope, posture, nature)
+                          for scope, posture, nature in zip(
+                              frame["denial_scope"], frame["liability_posture"],
+                              frame.get("nature_of_case", pd.Series("", index=frame.index)))]
+    frame["_methods"] = ["agree" if liability_disagreement_cell(a, b) is None else "differ"
+                         for a, b in zip(frame["liability_posture"],
+                                         frame["liability_posture_rule"])]
+    eligible = frame[~frame["_derived3"].isin(["not_applicable_procedural", "not_stated"])].copy()
+    if not len(eligible):
+        return pd.DataFrame()
+    eligible["_stratum"] = eligible["_derived3"] + "|" + eligible["_methods"]
+    sample, _allocation = stratified_sample(eligible, "_stratum", min(size, len(eligible)), seed)
+
+    columns = [c for c in ("case_id", "case_name", "source_html_file", "nature_of_case",
+                           "catchwords")
+               if c in sample.columns]
+    sheet = sample[columns].copy()
+    sheet["GUIDANCE"] = (
+        "List EVERY head liability or entitlement was denied for, from: primary_injury, "
+        "consequential_condition, specific_treatment, impairment_head, weekly_entitlement, "
+        "work_capacity. Use nothing_denied where the dispute was confined to quantum with no "
+        "denial at all. This field now DERIVES the three-value posture -- primary_injury means "
+        "liability_denied, nothing_denied means quantum_or_entitlement_only, anything else means "
+        "liability_denied_in_part -- so an error here becomes an error in the posture.")
+    sheet["HUMAN_denial_scope"] = ""
+    sheet["HUMAN_confident"] = ""
+    sheet["HUMAN_notes"] = ""
+    # Hideable tail: everything that reveals a machine's opinion.
+    for extra in ("denial_scope", "denial_scope_evidence", "liability_posture_evidence"):
+        if extra in sample.columns:
+            sheet[extra] = sample[extra]
+    sheet["_derived3"] = sample["_derived3"]
+    sheet["_methods_agree"] = sample["_methods"]
+    sheet["MODEL_liability_posture"] = sample["liability_posture"]
+    return sheet
+
+
 def build_reference_worksheets(extract, size=50, seed=20260815, prefill=False):
     """One blank hand-labelling worksheet per field needing a human reference set.
 
@@ -3744,6 +3873,9 @@ def write_reference_sets(path, extract, size=50, seed=20260815, prefill=False):
         curve = summarise_relief_curve(extract)
         if len(curve):
             curve.to_excel(writer, sheet_name="definitional_curve", index=False)
+        scope_sheet = build_denial_scope_worksheet(extract)
+        if len(scope_sheet):
+            scope_sheet.to_excel(writer, sheet_name="denial_scope_labels", index=False)
         pd.DataFrame([
             {"instruction": "Label HUMAN_<field> WITHOUT reading MODEL_<field> (rightmost "
                             "column) - it is placed last so you can hide it. Anchoring on the "

@@ -424,6 +424,98 @@ def test_the_partial_win_limitation_is_stated_where_a_consumer_reads_it():
     assert "Report it; do not build it in." in definition
 
 
+def _postures(n=400):
+    rows = []
+    for i in range(n):
+        if i % 4 == 0:
+            scope, posture, rule = "primary_injury", "liability_denied", "liability_denied"
+        elif i % 4 == 1:
+            scope, posture, rule = ("consequential_condition", "quantum_or_entitlement_only",
+                                    "quantum_or_entitlement_only")
+        elif i % 4 == 2:
+            scope, posture, rule = ("specific_treatment", "liability_denied",
+                                    "liability_denied")
+        else:
+            scope, posture, rule = ("nothing_denied", "quantum_or_entitlement_only",
+                                    "liability_denied")
+        rows.append({"case_id": f"C{i}", "case_name": f"Case {i}",
+                     "source_html_file": f"{i}.html", "nature_of_case": "Medical Dispute",
+                     "catchwords": "WORKERS COMPENSATION", "denial_scope": scope,
+                     "liability_posture": posture, "liability_posture_rule": rule,
+                     "liability_posture_evidence": "quote"})
+    return pd.DataFrame(rows)
+
+
+def test_the_derivation_uses_the_structural_reading_not_the_legal_one():
+    """Strictly, only a denied consequential condition denies LIABILITY; the
+    rest deny entitlements flowing from liability already accepted. The metric
+    measures conduct rather than pleading, so denying every weekly payment while
+    accepting every injury is not cooperative and must not code as such."""
+    assert wc.derive_three_value_posture("weekly_entitlement;work_capacity",
+                                         "liability_denied") == "liability_denied_in_part"
+    assert wc.derive_three_value_posture("impairment_head",
+                                         "liability_denied") == "liability_denied_in_part"
+    # primary_injury takes precedence over anything else in the list.
+    assert wc.derive_three_value_posture("primary_injury;specific_treatment",
+                                         "liability_denied") == "liability_denied"
+    assert wc.derive_three_value_posture("nothing_denied",
+                                         "liability_denied") == "quantum_or_entitlement_only"
+
+
+def test_procedural_is_keyed_on_nature_and_applied_last():
+    """It overrides: a procedural matter has no posture to describe, whatever
+    denial happened to be recorded against it."""
+    assert wc.derive_three_value_posture("primary_injury", "liability_denied",
+                                         "Procedural") == "not_applicable_procedural"
+    assert wc.derive_three_value_posture("specific_treatment", "liability_denied",
+                                         "Procedural") == "not_applicable_procedural"
+    # ...and does not fire on other dispute types.
+    assert wc.derive_three_value_posture("specific_treatment", "liability_denied",
+                                         "Medical Dispute") == "liability_denied_in_part"
+
+
+def test_a_blank_scope_falls_back_to_the_existing_binary():
+    """6 matters. A separate value would buy a category nobody can act on;
+    falling back keeps the binary's blind spot, which is the honest description
+    of what is known about them."""
+    assert wc.derive_three_value_posture("", "liability_denied") == "liability_denied"
+    assert wc.derive_three_value_posture(None, "quantum_or_entitlement_only") == (
+        "quantum_or_entitlement_only")
+    assert wc.derive_three_value_posture("not_stated", "liability_denied") == "liability_denied"
+
+
+def test_the_boundary_sheet_covers_cases_where_the_methods_agree():
+    """The 80-case adjudication set is drawn only from disagreement cells, and
+    66.2% of the predicted in_part mass sits on agreeing cases. Agreement on a
+    binary that cannot express the state is not evidence of correctness."""
+    sheet = wc.build_denial_scope_worksheet(_postures(), size=60)
+    assert len(sheet) == 60
+    assert set(sheet["_methods_agree"]) == {"agree", "differ"}
+    assert {"liability_denied", "liability_denied_in_part",
+            "quantum_or_entitlement_only"} <= set(sheet["_derived3"])
+
+
+def test_the_boundary_sheet_does_not_anchor_the_labeller():
+    sheet = wc.build_denial_scope_worksheet(_postures(), size=60)
+    columns = list(sheet.columns)
+    human = columns.index("HUMAN_denial_scope")
+    for name in ("_derived3", "_methods_agree", "MODEL_liability_posture", "denial_scope",
+                 "liability_posture_evidence"):
+        assert columns.index(name) > human, f"{name} anchors the labeller"
+
+
+def test_the_boundary_guidance_names_the_contested_edge():
+    sheet = wc.build_denial_scope_worksheet(_postures(), size=60)
+    guidance = sheet["GUIDANCE"].iloc[0]
+    assert "an error here becomes an error in the posture" in guidance
+
+
+def test_procedural_matters_are_out_of_scope_for_the_worksheet():
+    frame = _postures()
+    frame["nature_of_case"] = "Procedural"
+    assert wc.build_denial_scope_worksheet(frame, size=60).empty
+
+
 def test_a_frame_without_the_rule_column_yields_no_sheet_rather_than_a_bad_one():
     frame = _extract().drop(columns=["liability_posture_rule"])
     assert wc.build_liability_adjudication_sample(frame, size=50).empty
