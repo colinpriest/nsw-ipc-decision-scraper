@@ -3154,6 +3154,16 @@ WORKED_EXAMPLES = [
                        "name); look at the DISTRIBUTION before trusting the field (the pilot "
                        "histogram, which would have shown 64.4% single-head immediately).",
         how_it_was_caught="Each by chasing an anomaly. That is the pattern - and the problem.",
+        footnote="The wrong-construct species is not confined to fields. The validity criterion "
+                 "for liability_posture_3v was 'if the derived field and the LLM field disagree "
+                 "substantially, something is wrong' - and the raw disagreement came in at 45.6%, "
+                 "which sounds like a five-alarm result. It was not. 41.3% of it was cases moving "
+                 "into a value the binary HAS NO WAY TO EXPRESS, which is the new field working "
+                 "exactly as designed. Decomposed, the genuine conflict was 2.6%. The check was "
+                 "measuring agreement between two instruments with different vocabularies and "
+                 "calling it error. A check can measure the wrong construct as easily as a field "
+                 "can, and it is worse when it does, because the check is what you were relying "
+                 "on to catch the field.",
         the_fix="Match the defence to the species rather than running all three as ritual. But "
                 "note what the taxonomy exposes: all three defences are TRIGGERED BY SUSPICION. "
                 "Something has to look wrong first. So build at least one check that runs whether "
@@ -3394,7 +3404,16 @@ def derive_three_value_posture(denial_scope, posture, nature=None):
     if "primary_injury" in scope:
         value = "liability_denied"
     elif scope == "nothing_denied":
-        value = "quantum_or_entitlement_only"
+        # Known-blindness override, not an averaging of two instruments.
+        # DenialScopeEnum has no value for a worker-status or
+        # course-of-employment denial, so matters turning on 'was he a worker'
+        # or 'did the injury arise out of employment' record nothing_denied and
+        # would code as cooperative -- the single direction this field exists to
+        # prevent. Where the scope is structurally incapable of seeing the
+        # denial and the independent reading can, use the one that can see.
+        # 38 matters, all of them outright denials read as cooperative.
+        value = ("liability_denied" if str(posture) == "liability_denied"
+                 else "quantum_or_entitlement_only")
     elif not scope:
         # Blank falls back to the existing binary rather than becoming its own
         # value: 6 matters, so a separate 'not_stated' would buy a category

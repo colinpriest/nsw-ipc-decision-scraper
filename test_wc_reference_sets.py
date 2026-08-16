@@ -459,7 +459,8 @@ def test_the_derivation_uses_the_structural_reading_not_the_legal_one():
     assert wc.derive_three_value_posture("primary_injury;specific_treatment",
                                          "liability_denied") == "liability_denied"
     assert wc.derive_three_value_posture("nothing_denied",
-                                         "liability_denied") == "quantum_or_entitlement_only"
+                                         "quantum_or_entitlement_only") == (
+        "quantum_or_entitlement_only")
 
 
 def test_procedural_is_keyed_on_nature_and_applied_last():
@@ -472,6 +473,22 @@ def test_procedural_is_keyed_on_nature_and_applied_last():
     # ...and does not fire on other dispute types.
     assert wc.derive_three_value_posture("specific_treatment", "liability_denied",
                                          "Medical Dispute") == "liability_denied_in_part"
+
+
+def test_nothing_denied_defers_to_the_binary_where_the_enum_is_blind():
+    """DenialScopeEnum has no value for a worker-status or course-of-employment
+    denial, so those matters record nothing_denied and would code cooperative --
+    the one direction this field exists to prevent. Using the independent
+    reading only where the scope is structurally incapable of seeing the denial
+    is not averaging two instruments; it is using the one that can see."""
+    assert wc.derive_three_value_posture("nothing_denied",
+                                         "liability_denied") == "liability_denied"
+    # It defers ONLY on that pairing: a genuine quantum dispute is unaffected.
+    assert wc.derive_three_value_posture("nothing_denied", "quantum_or_entitlement_only") == (
+        "quantum_or_entitlement_only")
+    # And the override still loses to Procedural, which is applied last.
+    assert wc.derive_three_value_posture("nothing_denied", "liability_denied",
+                                         "Procedural") == "not_applicable_procedural"
 
 
 def test_a_blank_scope_falls_back_to_the_existing_binary():
